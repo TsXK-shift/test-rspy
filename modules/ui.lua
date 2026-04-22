@@ -209,6 +209,40 @@ function M.build(state)
     local selected = nil
     local showDetail -- forward
 
+    -- ── SCROLL INTELIGENTE ──
+    -- userScrolled: usuário subiu manualmente, pausa auto-scroll
+    -- pendingNew: quantos logs novos chegaram enquanto estava pausado
+    local userScrolled = false
+    local pendingNew = 0
+    local SCROLL_THRESHOLD = 30  -- px do fundo pra considerar "no fundo"
+
+    -- botão flutuante "⬇ Ir pro final (N novos)"
+    local JumpBtn = N("TextButton",{
+        Text = "⬇ Ir pro final", TextSize = 11, TextColor3 = C.BG,
+        Font = Enum.Font.GothamBold, BackgroundColor3 = C.Accent,
+        BorderSizePixel = 0, Size = UDim2.new(0,150,0,28),
+        Position = UDim2.new(1,-164,1,-38),  -- canto inferior direito do ListPanel
+        Visible = false, AutoButtonColor = true, ZIndex = 5,
+        Parent = ListPanel},{Rnd(14)})
+    JumpBtn.MouseButton1Click:Connect(function()
+        userScrolled = false
+        pendingNew = 0
+        JumpBtn.Visible = false
+        local h = math.max(0, #filtered * ITEM_S)
+        LogScroll.CanvasSize = UDim2.new(0,0,0,h)
+        local vis = LogScroll.AbsoluteSize.Y
+        LogScroll.CanvasPosition = Vector2.new(0, math.max(0, h-vis))
+    end)
+
+    -- detectar se usuário saiu do fundo
+    local function isAtBottom()
+        local h = LogScroll.CanvasSize.Y.Offset
+        local vis = LogScroll.AbsoluteSize.Y
+        local y = LogScroll.CanvasPosition.Y
+        if h <= vis then return true end  -- ainda cabe tudo na tela
+        return (h - vis - y) <= SCROLL_THRESHOLD
+    end
+
     local function rebuildFiltered()
         filtered = {}
         local f = state.config.filter or ""
@@ -252,7 +286,19 @@ function M.build(state)
         end
     end
 
-    LogScroll:GetPropertyChangedSignal("CanvasPosition"):Connect(renderList)
+    LogScroll:GetPropertyChangedSignal("CanvasPosition"):Connect(function()
+        renderList()
+        -- atualizar estado de scroll: se voltou pro fundo, retoma auto-scroll
+        if isAtBottom() then
+            if userScrolled then
+                userScrolled = false
+                pendingNew = 0
+                JumpBtn.Visible = false
+            end
+        else
+            userScrolled = true
+        end
+    end)
 
     for _, pi in ipairs(pool) do
         pi.click.MouseButton1Click:Connect(function()
@@ -454,6 +500,9 @@ function M.build(state)
         selected = nil
         currentLog = nil
         filtered = {}
+        userScrolled = false
+        pendingNew = 0
+        JumpBtn.Visible = false
         LogScroll.CanvasSize = UDim2.new(0,0,0,0)
         LogScroll.CanvasPosition = Vector2.new(0,0)
         for _, p in ipairs(pool) do p.item.Visible = false; p.log = nil end
@@ -665,7 +714,9 @@ function M.build(state)
             log.argsPreview = state.serializer.previewArgs(log.args or {}, 6)
             rebuildFiltered()
             CountLbl.Text = #filtered.." logs"
-            if state.config.autoScroll then
+
+            if state.config.autoScroll and not userScrolled then
+                -- usuário está no fundo: scrolla pro novo log normalmente
                 task.defer(function()
                     local h = math.max(0, #filtered * ITEM_S)
                     LogScroll.CanvasSize = UDim2.new(0,0,0,h)
@@ -674,6 +725,11 @@ function M.build(state)
                     renderList()
                 end)
             else
+                -- usuário subiu pra ler: não mexe no scroll, só atualiza canvas
+                -- e mostra quantos logs novos chegaram
+                pendingNew = pendingNew + 1
+                JumpBtn.Text = "⬇ "..pendingNew.." novo"..(pendingNew>1 and "s" or "")
+                JumpBtn.Visible = true
                 task.defer(renderList)
             end
         end,
