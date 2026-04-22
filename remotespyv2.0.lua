@@ -857,7 +857,7 @@ do
 end
 
 -- Conexões dos botões de detalhe (reconectadas a cada seleção)
-local _blkConn, _cpConn
+local _blkConn, _cpConn, _copyConn
 showDetail = function(log)
     if not log then return end
     local clr=typeClr(log.type)
@@ -883,9 +883,10 @@ showDetail = function(log)
     DScroll.CanvasPosition=Vector2.new(0,0)
 
     -- Botão copiar script
-    if _blkConn then _blkConn:Disconnect() end
-    if _cpConn  then _cpConn:Disconnect()  end
-    D.copyBtn.MouseButton1Click:Connect(function()
+    if _blkConn  then _blkConn:Disconnect()  end
+    if _cpConn   then _cpConn:Disconnect()   end
+    if _copyConn then _copyConn:Disconnect() end
+    _copyConn = D.copyBtn.MouseButton1Click:Connect(function()
         if not ENV.CanCopy then D.copyBtn.Text="❌ Sem clipboard"
             task.delay(2,function() D.copyBtn.Text="📋 Copiar Script" end); return end
         ENV.setclipboard(buildScript(log))
