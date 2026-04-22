@@ -15,7 +15,7 @@
 --═══════════════════════════════════════════════════════
 -- CONFIGURE AQUI: URL base do seu repositório (sem barra final)
 --═══════════════════════════════════════════════════════
-local BASE_URL = "https://raw.githubusercontent.com/SEU_USUARIO/SEU_REPO/main"
+local BASE_URL = "https://raw.githubusercontent.com/TsXK-shift/test-rspy/refs/heads/main"
 --═══════════════════════════════════════════════════════
 
 -- Detectar se rodando do arquivo único (build_single.lua coloca os módulos em getgenv())
