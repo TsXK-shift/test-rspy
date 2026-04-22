@@ -433,52 +433,62 @@ local function matchGroup(value, data)
     return groupKey(data) == value
 end
 
--- signature: identifica remotes "funcionalmente iguais"
--- assinatura = path + tipos dos args + valores dos args primitivos pequenos
--- ex: FireServer(970, {"Items","InUse"}, {algo grande}) → assinatura captura 970 e {"Items","InUse"}
---     mas ignora o 3º arg (table grande). Isso faz pegar todos os updates de "Items.InUse"
---     independente do conteúdo.
+-- signature: identifica remotes "funcionalmente iguais" por ESTRUTURA
+-- Objetivo: capturar o PADRÃO semântico, não os valores específicos.
+--
+-- Estratégia:
+--   - Números e strings longas viram placeholder "#" / "$"
+--   - Strings curtas (até 24 chars) SÃO incluídas — elas são "tipos/chaves"
+--   - Tabelas: inclui só as chaves (pras tabelas-como-caminho tipo {"Items","InUse"})
+--     usa os VALORES string, porque eles são o identificador do update
+--
+-- Exemplo prático:
+--   args = (1395, {"TimePlayed"}, 1970)   → sig: "#|[TimePlayed]|#"
+--   args = (1400, {"TimePlayed"}, 9999)   → sig: "#|[TimePlayed]|#"  ← MESMA!
+--   args = (1395, {"Items","InUse"}, {...}) → sig: "#|[Items,InUse]|{}"
+
+local SHORT_STR_LIMIT = 24
 
 local function argSignature(v, depth)
     depth = depth or 0
-    if depth > 3 then return "~" end
+    if depth > 2 then return "~" end
     local t = typeof(v)
     if t == "nil" then return "n"
-    elseif t == "boolean" then return tostring(v)
-    elseif t == "number" then
-        -- números inteiros pequenos entram na assinatura (IDs, codes)
-        if v == math.floor(v) and math.abs(v) < 100000 then
-            return tostring(v)
-        end
-        return "#"  -- número variável
+    elseif t == "boolean" then return "b"   -- só tipo, não valor
+    elseif t == "number" then return "#"    -- qualquer número = placeholder
     elseif t == "string" then
-        -- strings curtas entram na assinatura (comandos, chaves)
-        if #v <= 32 then return '"'..v..'"' end
+        -- strings curtas são "keys/tipos" → incluir valor
+        -- strings longas são "dados" → placeholder
+        if #v <= SHORT_STR_LIMIT then return '"'..v..'"' end
         return "$"
     elseif t == "Instance" then
         local ok, cls = pcall(function() return v.ClassName end)
         return "I:"..(ok and cls or "?")
     elseif t == "table" then
-        -- conta tamanho + inclui chaves pequenas
-        local count = 0
-        local keys = {}
-        for k in pairs(v) do
-            count = count + 1
-            if count > 6 then break end
-            if type(k) == "string" and #k <= 32 then
-                keys[#keys+1] = k
-            elseif type(k) == "number" then
-                keys[#keys+1] = "#"..k
+        -- caso especial: "path array" tipo {"Items","InUse","GrowingSeeds"}
+        -- se for array de strings curtas, inclui todas como identidade
+        local isStringArray = true
+        local strVals = {}
+        local n = 0
+        for k, val in pairs(v) do
+            n = n + 1
+            if type(k) ~= "number" or type(val) ~= "string" or #val > SHORT_STR_LIMIT then
+                isStringArray = false
+                break
             end
+            strVals[k] = val
         end
-        table.sort(keys)
-        return "{"..table.concat(keys, ",").."}"
+        if isStringArray and n > 0 and n <= 8 then
+            local parts = {}
+            for i = 1, n do parts[i] = strVals[i] end
+            return "["..table.concat(parts, ",").."]"
+        end
+        -- senão: só sinaliza que é tabela
+        return "{}"
     elseif t == "Vector3" or t == "Vector2" or t == "CFrame" then
-        return t  -- posição varia muito, só tipo
-    elseif t == "Color3" then
-        return "C"
-    elseif t == "EnumItem" then
-        return tostring(v)  -- enum é valor fixo
+        return t
+    elseif t == "Color3" then return "C"
+    elseif t == "EnumItem" then return "E"
     end
     return "?"
 end
@@ -1038,7 +1048,7 @@ function M.build(state)
     local Gui = N("ScreenGui",{Name="RSP_ProV4", ResetOnSpawn=false, IgnoreGuiInset=true,
         ZIndexBehavior=Enum.ZIndexBehavior.Sibling, Parent=parent})
 
-    local WIN_W, WIN_H = 820, 520
+    local WIN_W, WIN_H = 880, 560
 
     local Win = N("Frame",{Size=UDim2.new(0,WIN_W,0,WIN_H),
         Position=UDim2.new(0.5,-WIN_W/2,0.5,-WIN_H/2),
@@ -1324,7 +1334,7 @@ function M.build(state)
         Size=UDim2.new(0.5,0,1,0), Position=UDim2.new(0.5,0,0,0),
         TextXAlignment=Enum.TextXAlignment.Right, Parent=DTopBar})
 
-    local DInfoFrame = N("Frame",{Size=UDim2.new(1,-16,0,50),
+    local DInfoFrame = N("Frame",{Size=UDim2.new(1,-16,0,66),
         Position=UDim2.new(0,8,0,42), BackgroundColor3=C.BG,
         BorderSizePixel=0, Parent=DetailPanel}, {Rnd(5), Pad(4,8)})
     local DPathLbl = Lbl("", 10, C.TextD, Enum.Font.Code, {
@@ -1333,11 +1343,14 @@ function M.build(state)
         Size=UDim2.new(1,0,0,14), Position=UDim2.new(0,0,0,16), Parent=DInfoFrame})
     local DTimeLbl = Lbl("", 10, C.TextM, Enum.Font.Gotham, {
         Size=UDim2.new(1,0,0,14), Position=UDim2.new(0,0,0,32), Parent=DInfoFrame})
+    -- preview da signature (mostra exatamente o que o botão "Padrão" vai bloquear)
+    local DSigLbl = Lbl("", 9, Color3.fromRGB(255,130,220), Enum.Font.Code, {
+        Size=UDim2.new(1,0,0,14), Position=UDim2.new(0,0,0,48),
+        TextTruncate=Enum.TextTruncate.AtEnd, Parent=DInfoFrame})
 
-    -- code box: mostra script Lua executável gerado
-    -- (altura ajustada pra dar espaço aos 2 rows de botões embaixo: 74+16 = 90px)
-    local CodeContainer = N("Frame",{Size=UDim2.new(1,-16,1,-190),
-        Position=UDim2.new(0,8,0,100), BackgroundColor3=C.BG,
+    -- code box: altura considera info frame (66+42=108) e 2 rows de botões (70+16)
+    local CodeContainer = N("Frame",{Size=UDim2.new(1,-16,1,-210),
+        Position=UDim2.new(0,8,0,116), BackgroundColor3=C.BG,
         BorderSizePixel=0, Parent=DetailPanel}, {Rnd(5)})
     local CodeScroll = N("ScrollingFrame",{Size=UDim2.new(1,0,1,0),
         BackgroundTransparency=1, BorderSizePixel=0, ScrollBarThickness=4,
@@ -1350,41 +1363,43 @@ function M.build(state)
         TextYAlignment=Enum.TextYAlignment.Top, TextWrapped=false,
         Parent=CodeScroll})
 
-    -- ações (2 linhas pra caber bem)
-    local ActBar = N("Frame",{Size=UDim2.new(1,-16,0,66),
-        Position=UDim2.new(0,8,1,-74), BackgroundTransparency=1, Parent=DetailPanel})
+    -- ações: 2 linhas com UIListLayout (não usa position fixa = sem sobreposição)
+    local ActBar = N("Frame",{Size=UDim2.new(1,-16,0,70),
+        Position=UDim2.new(0,8,1,-78), BackgroundTransparency=1, Parent=DetailPanel})
 
-    -- LINHA 1: cópia + executar
-    local CopyScriptBtn = Btn("📋 Copiar Script", 11, {Size=UDim2.new(0,130,0,28),
-        Position=UDim2.new(0,0,0,0), BackgroundColor3=C.AccentD,
-        Parent=ActBar}, {Rnd(5)})
-    local CopyPathBtn = Btn("📝 Path", 11, {Size=UDim2.new(0,70,0,28),
-        Position=UDim2.new(0,136,0,0), BackgroundColor3=C.Panel,
-        Parent=ActBar}, {Rnd(5)})
-    local CopyArgsBtn = Btn("📦 Args", 11, {Size=UDim2.new(0,70,0,28),
-        Position=UDim2.new(0,212,0,0), BackgroundColor3=C.Panel,
-        Parent=ActBar}, {Rnd(5)})
-    local RunBtn = Btn("▶ Executar", 11, {Size=UDim2.new(0,100,0,28),
-        Position=UDim2.new(1,-102,0,0), BackgroundColor3=Color3.fromRGB(25,70,35),
-        TextColor3=C.Success, Parent=ActBar}, {Rnd(5)})
+    local Row1 = N("Frame",{Size=UDim2.new(1,0,0,30),
+        Position=UDim2.new(0,0,0,0), BackgroundTransparency=1, Parent=ActBar},{
+        N("UIListLayout",{FillDirection=Enum.FillDirection.Horizontal,
+            Padding=UDim.new(0,6), SortOrder=Enum.SortOrder.LayoutOrder})})
+    local Row2 = N("Frame",{Size=UDim2.new(1,0,0,30),
+        Position=UDim2.new(0,0,0,36), BackgroundTransparency=1, Parent=ActBar},{
+        N("UIListLayout",{FillDirection=Enum.FillDirection.Horizontal,
+            Padding=UDim.new(0,6), SortOrder=Enum.SortOrder.LayoutOrder})})
 
-    -- LINHA 2: bloqueios (4 tipos)
-    local BlockExactBtn = Btn("🚫 Path", 10, {Size=UDim2.new(0,70,0,28),
-        Position=UDim2.new(0,0,0,34),
+    -- LINHA 1: cópia + executar (sempre à direita do lado)
+    local CopyScriptBtn = Btn("📋 Copiar Script", 11, {Size=UDim2.new(0,130,1,0),
+        BackgroundColor3=C.AccentD, LayoutOrder=1, Parent=Row1}, {Rnd(5)})
+    local CopyPathBtn = Btn("📝 Path", 11, {Size=UDim2.new(0,70,1,0),
+        BackgroundColor3=C.Panel, LayoutOrder=2, Parent=Row1}, {Rnd(5)})
+    local CopyArgsBtn = Btn("📦 Args", 11, {Size=UDim2.new(0,70,1,0),
+        BackgroundColor3=C.Panel, LayoutOrder=3, Parent=Row1}, {Rnd(5)})
+    local RunBtn = Btn("▶ Executar", 11, {Size=UDim2.new(0,100,1,0),
+        BackgroundColor3=Color3.fromRGB(25,70,35), TextColor3=C.Success,
+        LayoutOrder=4, Parent=Row1}, {Rnd(5)})
+
+    -- LINHA 2: bloqueios (4 tipos, ordem de especificidade)
+    local BlockExactBtn = Btn("🚫 Path", 10, {Size=UDim2.new(0,70,1,0),
         BackgroundColor3=Color3.fromRGB(50,18,18), TextColor3=C.Error,
-        Parent=ActBar}, {Rnd(5)})
-    local BlockSigBtn = Btn("🚫 Args iguais", 10, {Size=UDim2.new(0,110,0,28),
-        Position=UDim2.new(0,76,0,34),
+        LayoutOrder=1, Parent=Row2}, {Rnd(5)})
+    local BlockSigBtn = Btn("🚫 Padrão (spam)", 10, {Size=UDim2.new(0,130,1,0),
         BackgroundColor3=Color3.fromRGB(60,18,45), TextColor3=Color3.fromRGB(255,130,220),
-        Parent=ActBar}, {Rnd(5)})
-    local BlockGroupBtn = Btn("🚫 Grupo", 10, {Size=UDim2.new(0,80,0,28),
-        Position=UDim2.new(0,192,0,34),
+        LayoutOrder=2, Parent=Row2}, {Rnd(5)})
+    local BlockGroupBtn = Btn("🚫 Grupo", 10, {Size=UDim2.new(0,76,1,0),
         BackgroundColor3=Color3.fromRGB(60,30,18), TextColor3=Color3.fromRGB(255,180,120),
-        Parent=ActBar}, {Rnd(5)})
-    local BlockWildBtn = Btn("🚫 Pasta", 10, {Size=UDim2.new(0,80,0,28),
-        Position=UDim2.new(0,278,0,34),
+        LayoutOrder=3, Parent=Row2}, {Rnd(5)})
+    local BlockWildBtn = Btn("🚫 Pasta", 10, {Size=UDim2.new(0,76,1,0),
         BackgroundColor3=Color3.fromRGB(55,30,55), TextColor3=Color3.fromRGB(230,150,230),
-        Parent=ActBar}, {Rnd(5)})
+        LayoutOrder=4, Parent=Row2}, {Rnd(5)})
     local RunBtn = Btn("▶ Executar", 11, {Size=UDim2.new(0,94,1,0),
         Position=UDim2.new(1,-96,0,0), BackgroundColor3=Color3.fromRGB(25,70,35),
         TextColor3=C.Success, Parent=ActBar}, {Rnd(5)})
@@ -1417,6 +1432,10 @@ function M.build(state)
             DTimeLbl.TextColor3 = C.TextM
         end
         DTimeLbl.Text = timeTxt
+
+        -- mostra o padrão (signature) que o botão "🚫 Padrão" bloqueia
+        local sigPreview = state.blockerLib.signatureKey(log)
+        DSigLbl.Text = "🔖 padrão: "..sigPreview
 
         -- gerar script
         CodeBox.Text = "-- gerando..."
@@ -1520,12 +1539,12 @@ function M.build(state)
         local removed = state.blockerLib.removeRule(state.blocker, "signature", sk)
         if not removed then
             state.blockerLib.addRule(state.blocker, "signature", sk, {silent = state.config.hideBlocked})
-            BlockSigBtn.Text = "✅ Args bloq."
+            BlockSigBtn.Text = "✅ Padrão bloqueado"
         else
-            BlockSigBtn.Text = "🚫 Args iguais"
+            BlockSigBtn.Text = "🚫 Padrão (spam)"
         end
         if uiApi then pcall(uiApi.rebuild) end
-        task.delay(1.5, function() BlockSigBtn.Text = "🚫 Args iguais" end)
+        task.delay(1.5, function() BlockSigBtn.Text = "🚫 Padrão (spam)" end)
     end)
 
     -- Bloqueio por grupo (mesmo parent + shape do nome — pega mutações de nome)
