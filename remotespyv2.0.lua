@@ -72,7 +72,9 @@ local RSP = {
         Bindables      = true,
         AutoScroll     = true,
         MaxArgs        = 8,
+        IgnoreSelf     = false, -- true = não loga chamadas do próprio executor
     },
+    _hookStats = {fs=0, is=0, ce=0, nc=0},
     UI        = {},
     _logCBs   = {},
     _originals= {},
@@ -261,8 +263,9 @@ local function setupHookFunction()
 
     results[1] = pcall(function()
         ENV.hookfunction(orig_FS, ENV.newcclosure(function(self, ...)
-            if ENV.checkcaller() then return orig_FS(self, ...) end
-            if not RSP.Settings.FireServer then return orig_FS(self, ...) end
+            if RSP.Settings.IgnoreSelf and ENV.checkcaller() then return orig_FS(self, ...) end
+            if not RSP.Enabled or not RSP.Settings.FireServer then return orig_FS(self, ...) end
+            RSP._hookStats.fs = RSP._hookStats.fs + 1
             local args = {...}
             local path = safePath(self)
             local blocked = RSP.Blocked[path]
@@ -278,8 +281,9 @@ local function setupHookFunction()
 
     results[2] = pcall(function()
         ENV.hookfunction(orig_IS, ENV.newcclosure(function(self, ...)
-            if ENV.checkcaller() then return orig_IS(self, ...) end
-            if not RSP.Settings.InvokeServer then return orig_IS(self, ...) end
+            if RSP.Settings.IgnoreSelf and ENV.checkcaller() then return orig_IS(self, ...) end
+            if not RSP.Enabled or not RSP.Settings.InvokeServer then return orig_IS(self, ...) end
+            RSP._hookStats.is = RSP._hookStats.is + 1
             local args = {...}
             local path = safePath(self)
             local blocked = RSP.Blocked[path]
@@ -295,8 +299,8 @@ local function setupHookFunction()
 
     results[3] = pcall(function()
         ENV.hookfunction(orig_FBE, ENV.newcclosure(function(self, ...)
-            if ENV.checkcaller() then return orig_FBE(self, ...) end
-            if not RSP.Settings.Bindables then return orig_FBE(self, ...) end
+            if RSP.Settings.IgnoreSelf and ENV.checkcaller() then return orig_FBE(self, ...) end
+            if not RSP.Enabled or not RSP.Settings.Bindables then return orig_FBE(self, ...) end
             local args = {...}
             local path = safePath(self)
             addLog({ type="Fire", remoteType="BindableEvent",
@@ -309,8 +313,8 @@ local function setupHookFunction()
 
     results[4] = pcall(function()
         ENV.hookfunction(orig_IBF, ENV.newcclosure(function(self, ...)
-            if ENV.checkcaller() then return orig_IBF(self, ...) end
-            if not RSP.Settings.Bindables then return orig_IBF(self, ...) end
+            if RSP.Settings.IgnoreSelf and ENV.checkcaller() then return orig_IBF(self, ...) end
+            if not RSP.Enabled or not RSP.Settings.Bindables then return orig_IBF(self, ...) end
             local args = {...}
             local path = safePath(self)
             addLog({ type="Invoke", remoteType="BindableFunction",
@@ -337,9 +341,11 @@ local function setupNamecallHook()
     RSP._originals.__namecall = oldNC
     local ok = pcall(ENV.hookmetamethod, game, "__namecall", ENV.newcclosure(function(self, ...)
         local method = ENV.getnamecallmethod()
-        if ENV.checkcaller() or not RSP.Enabled then return oldNC(self, ...) end
+        if not RSP.Enabled then return oldNC(self, ...) end
+        if RSP.Settings.IgnoreSelf and ENV.checkcaller() then return oldNC(self, ...) end
         local t = typeof(self)=="Instance" and self.ClassName or ""
         if t=="RemoteEvent" and method=="FireServer" and RSP.Settings.FireServer then
+            RSP._hookStats.nc = RSP._hookStats.nc + 1
             local args, path = {...}, safePath(self)
             local blocked = RSP.Blocked[path]
             local src, ln = getCallerSafe()
@@ -494,6 +500,12 @@ local function initHooks()
     end
     print(string.format("[RSP] ✅ Hook ativo: %s", hookMode))
 end
+
+-- CRÍTICO: inicializar hooks ANTES da UI. Se esperar a UI montar,
+-- perde todos os FireServer iniciais (inicialização de inventário,
+-- posição, character select, etc). É isso que fazia parecer que só
+-- capturava OnClientEvent.
+initHooks()
 
 -- ╔══════════════════════════════════════╗
 -- ║          INTERFACE GRÁFICA           ║
@@ -1140,6 +1152,7 @@ CfgTog("OnClientInvoke (Server → Client)", "OnClientInvoke",5)
 CfgTog("Bindables (BindableEvent/Function)","Bindables",    6)
 CfgSec("── Interface ──",7)
 CfgTog("Auto Scroll","AutoScroll",8)
+CfgTog("Ignorar próprio executor (checkcaller)","IgnoreSelf",8.5)
 -- Max args
 local maxRow=N("Frame",{Size=UDim2.new(1,0,0,30),BackgroundColor3=C.Surface,
     BorderSizePixel=0,LayoutOrder=9,Parent=CfgContent},{Rnd(6),Pad(0,10)})
@@ -1224,16 +1237,20 @@ end
 -- ── INICIALIZAÇÃO ──
 switchTab("Logs")
 
+-- Mostrar logs que foram capturados antes da UI ser construída
+rebuildFiltered()
+LogCountLbl.Text = #filteredLogs .. " logs"
+renderList()
+
 Win.Size=UDim2.new(0,0,0,0)
 Win.Position=UDim2.new(0.5,0,0.5,0)
 TweenService:Create(Win,TweenInfo.new(0.3,Enum.EasingStyle.Back,Enum.EasingDirection.Out),{
     Size=UDim2.new(0,WIN_W,0,WIN_H),
     Position=UDim2.new(0.5,-WIN_W/2,0.5,-WIN_H/2)}):Play()
 
--- Hooks em thread separada (não trava a UI)
+-- Log de inicialização (hooks já foram ativados antes da UI)
 task.spawn(function()
-    task.wait(0.3)
-    initHooks()
+    task.wait(0.1)
     addLog({
         type="FireServer", remoteType="Sistema",
         remoteName="RSP Inicializado", remotePath="System.RSP",
