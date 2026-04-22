@@ -1,2018 +1,1250 @@
 --[[
-    ██████╗ ███████╗███╗   ███╗ ██████╗ ████████╗███████╗    ███████╗██████╗ ██╗   ██╗
-    ██╔══██╗██╔════╝████╗ ████║██╔═══██╗╚══██╔══╝██╔════╝    ██╔════╝██╔══██╗╚██╗ ██╔╝
-    ██████╔╝█████╗  ██╔████╔██║██║   ██║   ██║   █████╗      ███████╗██████╔╝ ╚████╔╝ 
-    ██╔══██╗██╔══╝  ██║╚██╔╝██║██║   ██║   ██║   ██╔══╝      ╚════██║██╔═══╝   ╚██╔╝  
-    ██║  ██║███████╗██║ ╚═╝ ██║╚██████╔╝   ██║   ███████╗    ███████║██║        ██║   
-    ╚═╝  ╚═╝╚══════╝╚═╝     ╚═╝ ╚═════╝    ╚═╝   ╚══════╝    ╚══════╝╚═╝        ╚═╝   
-    
-    Remote Spy Pro - Script de Espionagem de Remotes Completo
-    Versão: 2.0
-    Compatível com execução no cliente (exploits como Synapse X, KRNL, etc.)
-    
-    Funcionalidades:
-    - Hook em RemoteEvent:FireServer / InvokeServer
-    - Hook em RemoteFunction:InvokeServer
-    - Hook em eventos recebidos do servidor (OnClientEvent / OnClientInvoke)
-    - Hook em BindableEvent e BindableFunction
-    - Exibe argumentos formatados com tipo
-    - UI com abas: Remotes, Logs, Bloqueados, Configurações
-    - Filtros por nome, tipo
-    - Bloquear/permitir remotes individuais
-    - Copiar chamadas como código Lua
-    - Script caller (rastrear de onde foi chamado)
-    - Histórico de logs com timestamp
-    - Contador de chamadas por remote
-    - Detalhe completo de cada chamada
+    Remote Spy Pro v3.0
+    Compatível com: Xeno, Delta, Solara, Fluxus, KRNL, Synapse X e outros
+
+    ESTRATÉGIA DE HOOK (em ordem de prioridade):
+    1. hookfunction no protótipo do RemoteEvent/RemoteFunction (funciona no Xeno)
+    2. hookmetamethod via __namecall (Synapse X, Wave, etc.)
+    3. Scan de instâncias + patch individual (fallback universal)
+
+    PERFORMANCE:
+    - Renderização virtual: apenas ~16 itens visíveis renderizados por vez
+    - Sem AutomaticCanvasSize (causa freeze no Delta)
+    - Sem AutomaticSize em listas (causa recálculo a cada frame)
+    - Batch de UI updates via task.defer
 ]]
 
--- ============================================================
--- VERIFICAÇÕES DE AMBIENTE
--- ============================================================
+-- ╔══════════════════════════════════════╗
+-- ║       DETECÇÃO DE AMBIENTE           ║
+-- ╚══════════════════════════════════════╝
 
-local RunService = game:GetService("RunService")
-local Players = game:GetService("Players")
-local CoreGui = game:GetService("CoreGui")
+local ENV = {
+    hookfunction      = (hookfunction or replaceclosure or nil),
+    hookmetamethod    = (hookmetamethod or nil),
+    newcclosure       = (newcclosure or function(f) return f end),
+    getnamecallmethod = (getnamecallmethod or nil),
+    checkcaller       = (checkcaller or function() return false end),
+    setclipboard      = (setclipboard or toclipboard or rbxtheclip or nil),
+    getrawmetatable   = (getrawmetatable or nil),
+    isexecutorclosure = (isexecutorclosure or function() return false end),
+    cloneref          = (cloneref or function(x) return x end),
+    Name = (identifyexecutor and identifyexecutor())
+        or (getexecutorname and getexecutorname())
+        or "Unknown",
+}
+
+ENV.CanHookFunction = ENV.hookfunction ~= nil
+ENV.CanHookMeta     = ENV.hookmetamethod ~= nil and ENV.getnamecallmethod ~= nil
+ENV.CanCopy         = ENV.setclipboard ~= nil
+
+print(string.format("[RSP] Executor: %s | hookfunction: %s | hookmetamethod: %s",
+    ENV.Name, tostring(ENV.CanHookFunction), tostring(ENV.CanHookMeta)))
+
+-- ╔══════════════════════════════════════╗
+-- ║            SERVIÇOS                  ║
+-- ╚══════════════════════════════════════╝
+
+local RunService       = game:GetService("RunService")
+local Players          = game:GetService("Players")
+local CoreGui          = game:GetService("CoreGui")
 local UserInputService = game:GetService("UserInputService")
-local TweenService = game:GetService("TweenService")
-local HttpService = game:GetService("HttpService")
+local TweenService     = game:GetService("TweenService")
+local HttpService      = game:GetService("HttpService")
+local LocalPlayer      = Players.LocalPlayer
 
-local LocalPlayer = Players.LocalPlayer
-local Mouse = LocalPlayer:GetMouse()
-
--- Funções de exploit necessárias
-local getrawmetatable = getrawmetatable or rawget
-local hookmetamethod = hookmetamethod or nil
-local newcclosure = newcclosure or function(f) return f end
-local checkcaller = checkcaller or function() return false end
-local getcallingscript = getcallingscript or function() return nil end
-local isexecutorclosure = isexecutorclosure or function() return false end
-local cloneref = cloneref or function(x) return x end
-local getnamecallmethod = getnamecallmethod or function() return "" end
-
--- ============================================================
--- ESTADO GLOBAL
--- ============================================================
+-- ╔══════════════════════════════════════╗
+-- ║         ESTADO GLOBAL                ║
+-- ╚══════════════════════════════════════╝
 
 local RSP = {
-    Enabled = true,
-    Logs = {},
-    Blocked = {},
-    MaxLogs = 500,
-    Settings = {
-        ShowFireServer = true,
-        ShowInvokeServer = true,
-        ShowOnClientEvent = true,
-        ShowOnClientInvoke = true,
-        ShowBindables = true,
-        LogCallerScript = true,
-        LogCallerLine = true,
-        AutoScroll = true,
-        ShowNotifications = true,
-        MaxArgs = 10,
-        Theme = "Dark",
+    Version   = "3.0",
+    Enabled   = true,
+    Logs      = {},
+    Blocked   = {},
+    Stats     = {},
+    MaxLogs   = 300,
+    Filter    = "",
+    Settings  = {
+        FireServer     = true,
+        InvokeServer   = true,
+        OnClientEvent  = true,
+        OnClientInvoke = true,
+        Bindables      = true,
+        AutoScroll     = true,
+        MaxArgs        = 8,
     },
-    Stats = {},  -- { [remotePath] = { calls = 0, blocked = 0 } }
-    Filter = "",
-    SelectedLog = nil,
-    CurrentTab = "Logs",
-    UI = {},
-    Connections = {},
-    OriginalFunctions = {},
-    Version = "2.0",
+    UI        = {},
+    _logCBs   = {},
+    _originals= {},
+    _patched  = {},
 }
 
--- ============================================================
--- UTILIDADES
--- ============================================================
-
-local function getTimestamp()
-    return os.date("%H:%M:%S")
-end
-
-local function getFullPath(instance)
-    if not instance then return "Unknown" end
-    local ok, path = pcall(function()
-        local parts = {}
-        local obj = instance
-        while obj and obj ~= game do
-            table.insert(parts, 1, obj.Name)
-            obj = obj.Parent
-        end
-        return table.concat(parts, ".")
-    end)
-    return ok and path or tostring(instance)
-end
-
-local function formatValue(value, depth)
-    depth = depth or 0
-    if depth > 3 then return "..." end
-    
-    local t = typeof(value)
-    
-    if t == "string" then
-        local escaped = value:gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("\n", "\\n"):gsub("\r", "\\r")
-        if #escaped > 80 then
-            return string.format('"%s..." [string:%d]', escaped:sub(1, 77), #value)
-        end
-        return string.format('"%s"', escaped)
-    elseif t == "number" then
-        if value == math.floor(value) then
-            return string.format("%d", value)
-        end
-        return string.format("%.4f", value):gsub("%.?0+$", "")
-    elseif t == "boolean" then
-        return tostring(value)
-    elseif t == "nil" then
-        return "nil"
-    elseif t == "table" then
-        local count = 0
-        local parts = {}
-        for k, v in pairs(value) do
-            count = count + 1
-            if count > 8 then
-                table.insert(parts, string.format("... (+%d)", count - 8))
-                break
-            end
-            local key = type(k) == "string" and k or string.format("[%s]", tostring(k))
-            table.insert(parts, string.format("%s = %s", key, formatValue(v, depth + 1)))
-        end
-        if count == 0 then return "{}" end
-        return "{ " .. table.concat(parts, ", ") .. " }"
-    elseif t == "Instance" then
-        local ok, path = pcall(getFullPath, value)
-        local cls = ok and value.ClassName or "Instance"
-        return string.format("<%s: %s>", cls, ok and path or "?")
-    elseif t == "Vector3" then
-        return string.format("Vector3(%g, %g, %g)", value.X, value.Y, value.Z)
-    elseif t == "Vector2" then
-        return string.format("Vector2(%g, %g)", value.X, value.Y)
-    elseif t == "CFrame" then
-        local p = value.Position
-        return string.format("CFrame(%g, %g, %g)", p.X, p.Y, p.Z)
-    elseif t == "Color3" then
-        return string.format("Color3(%d, %d, %d)", value.R*255, value.G*255, value.B*255)
-    elseif t == "UDim2" then
-        return string.format("UDim2(%g,%g, %g,%g)", value.X.Scale, value.X.Offset, value.Y.Scale, value.Y.Offset)
-    elseif t == "Enum" or t == "EnumItem" then
-        return tostring(value)
-    elseif t == "function" then
-        return string.format("<function>")
-    elseif t == "userdata" then
-        return string.format("<userdata>")
-    else
-        return string.format("<%s: %s>", t, tostring(value))
-    end
-end
-
-local function formatArgs(args)
-    if not args or #args == 0 then return "()" end
-    local parts = {}
-    for i, v in ipairs(args) do
-        if i > RSP.Settings.MaxArgs then
-            table.insert(parts, string.format("... (+%d args)", #args - RSP.Settings.MaxArgs))
-            break
-        end
-        table.insert(parts, formatValue(v))
-    end
-    return "(" .. table.concat(parts, ", ") .. ")"
-end
-
-local function valueToLua(value, depth)
-    depth = depth or 0
-    if depth > 3 then return "nil --[[deep]]" end
-    local t = typeof(value)
-    if t == "string" then
-        return string.format("%q", value)
-    elseif t == "number" or t == "boolean" or t == "nil" then
-        return tostring(value)
-    elseif t == "table" then
-        local parts = {}
-        for k, v in pairs(value) do
-            local key = type(k) == "string" and string.format("[%q]", k) or string.format("[%d]", k)
-            table.insert(parts, string.format("  %s = %s", key, valueToLua(v, depth+1)))
-        end
-        return "{\n" .. table.concat(parts, ",\n") .. "\n}"
-    elseif t == "Vector3" then
-        return string.format("Vector3.new(%g, %g, %g)", value.X, value.Y, value.Z)
-    elseif t == "Vector2" then
-        return string.format("Vector2.new(%g, %g)", value.X, value.Y)
-    elseif t == "CFrame" then
-        local p = value.Position
-        return string.format("CFrame.new(%g, %g, %g)", p.X, p.Y, p.Z)
-    elseif t == "Color3" then
-        return string.format("Color3.fromRGB(%d, %d, %d)", value.R*255, value.G*255, value.B*255)
-    elseif t == "UDim2" then
-        return string.format("UDim2.new(%g, %g, %g, %g)", value.X.Scale, value.X.Offset, value.Y.Scale, value.Y.Offset)
-    elseif t == "EnumItem" then
-        return tostring(value)
-    elseif t == "Instance" then
-        return string.format('game:GetService("Players").LocalPlayer --[[%s]]', getFullPath(value))
-    else
-        return string.format("nil --[[%s]]", t)
-    end
-end
-
-local function argsToLua(args)
-    local parts = {}
-    for _, v in ipairs(args or {}) do
-        table.insert(parts, valueToLua(v))
-    end
-    return table.concat(parts, ", ")
-end
-
-local function getCallerInfo()
-    if not RSP.Settings.LogCallerScript then return nil, nil end
-    local ok, info = pcall(function()
-        -- Pular frames internos do RemoteSpy
-        for i = 3, 10 do
-            local dbinfo = debug.info(i, "sln")
-            if dbinfo then
-                local src = dbinfo[1] or ""
-                local line = dbinfo[2] or 0
-                local name = dbinfo[3] or ""
-                -- Ignorar frames do executor e do RemoteSpy
-                if not src:find("RemoteSpy") and not src:find("executor") and src ~= "" then
-                    return src, line
-                end
-            end
-        end
-        return nil, nil
-    end)
-    if ok then return info end
-    return nil, nil
-end
-
--- ============================================================
--- SISTEMA DE LOGGING
--- ============================================================
-
-local logCallbacks = {}
-
-local function addLog(logData)
-    -- Incrementar stats
-    local path = logData.remotePath or "unknown"
-    if not RSP.Stats[path] then
-        RSP.Stats[path] = { calls = 0, blocked = 0 }
-    end
-    RSP.Stats[path].calls = RSP.Stats[path].calls + 1
-    if logData.blocked then
-        RSP.Stats[path].blocked = RSP.Stats[path].blocked + 1
-    end
-    
-    logData.id = #RSP.Logs + 1
-    logData.timestamp = getTimestamp()
-    
-    table.insert(RSP.Logs, logData)
-    
-    -- Limitar tamanho
-    while #RSP.Logs > RSP.MaxLogs do
-        table.remove(RSP.Logs, 1)
-    end
-    
-    -- Notificar callbacks de UI
-    for _, cb in ipairs(logCallbacks) do
-        pcall(cb, logData)
-    end
-end
-
-local function onNewLog(callback)
-    table.insert(logCallbacks, callback)
-end
-
--- ============================================================
--- HOOK ENGINE
--- ============================================================
-
-local hooked = false
-
-local function setupHooks()
-    if hooked then return end
-    hooked = true
-    
-    -- Verificar se hookmetamethod está disponível
-    if not hookmetamethod then
-        warn("[RemoteSpy] hookmetamethod não disponível. Usando método alternativo.")
-        -- Método alternativo: monkey patch direto nas instâncias descobertas
-        setupAlternativeHook()
-        return
-    end
-    
-    local gameMeta = getrawmetatable(game)
-    local oldNamecall = gameMeta.__namecall
-    RSP.OriginalFunctions.__namecall = oldNamecall
-    
-    hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
-        if not RSP.Enabled then
-            return oldNamecall(self, ...)
-        end
-        
-        local method = getnamecallmethod()
-        local args = {...}
-        
-        -- Verificar se é chamada interna do executor
-        if checkcaller and checkcaller() then
-            return oldNamecall(self, ...)
-        end
-        
-        local isRemoteEvent = typeof(self) == "Instance" and self:IsA("RemoteEvent")
-        local isRemoteFunction = typeof(self) == "Instance" and self:IsA("RemoteFunction")
-        local isBindableEvent = typeof(self) == "Instance" and self:IsA("BindableEvent")
-        local isBindableFunction = typeof(self) == "Instance" and self:IsA("BindableFunction")
-        
-        -- RemoteEvent:FireServer
-        if isRemoteEvent and method == "FireServer" then
-            if not RSP.Settings.ShowFireServer then
-                return oldNamecall(self, ...)
-            end
-            
-            local path = getFullPath(self)
-            local isBlocked = RSP.Blocked[path]
-            
-            local callerSrc, callerLine = getCallerInfo()
-            
-            addLog({
-                type = "FireServer",
-                remoteType = "RemoteEvent",
-                remoteName = self.Name,
-                remotePath = path,
-                remote = self,
-                args = args,
-                argsFormatted = formatArgs(args),
-                blocked = isBlocked,
-                callerScript = callerSrc,
-                callerLine = callerLine,
-                direction = "→ Server",
-            })
-            
-            if isBlocked then return end
-            return oldNamecall(self, ...)
-        end
-        
-        -- RemoteFunction:InvokeServer
-        if isRemoteFunction and method == "InvokeServer" then
-            if not RSP.Settings.ShowInvokeServer then
-                return oldNamecall(self, ...)
-            end
-            
-            local path = getFullPath(self)
-            local isBlocked = RSP.Blocked[path]
-            
-            local callerSrc, callerLine = getCallerInfo()
-            
-            addLog({
-                type = "InvokeServer",
-                remoteType = "RemoteFunction",
-                remoteName = self.Name,
-                remotePath = path,
-                remote = self,
-                args = args,
-                argsFormatted = formatArgs(args),
-                blocked = isBlocked,
-                callerScript = callerSrc,
-                callerLine = callerLine,
-                direction = "→ Server",
-            })
-            
-            if isBlocked then return nil end
-            return oldNamecall(self, ...)
-        end
-        
-        -- BindableEvent:Fire
-        if isBindableEvent and method == "Fire" and RSP.Settings.ShowBindables then
-            local path = getFullPath(self)
-            local isBlocked = RSP.Blocked[path]
-            
-            local callerSrc, callerLine = getCallerInfo()
-            
-            addLog({
-                type = "Fire",
-                remoteType = "BindableEvent",
-                remoteName = self.Name,
-                remotePath = path,
-                remote = self,
-                args = args,
-                argsFormatted = formatArgs(args),
-                blocked = isBlocked,
-                callerScript = callerSrc,
-                callerLine = callerLine,
-                direction = "→ Bindable",
-            })
-            
-            if isBlocked then return end
-            return oldNamecall(self, ...)
-        end
-        
-        -- BindableFunction:Invoke
-        if isBindableFunction and method == "Invoke" and RSP.Settings.ShowBindables then
-            local path = getFullPath(self)
-            local isBlocked = RSP.Blocked[path]
-            
-            local callerSrc, callerLine = getCallerInfo()
-            
-            addLog({
-                type = "Invoke",
-                remoteType = "BindableFunction",
-                remoteName = self.Name,
-                remotePath = path,
-                remote = self,
-                args = args,
-                argsFormatted = formatArgs(args),
-                blocked = isBlocked,
-                callerScript = callerSrc,
-                callerLine = callerLine,
-                direction = "→ Bindable",
-            })
-            
-            if isBlocked then return nil end
-            return oldNamecall(self, ...)
-        end
-        
-        return oldNamecall(self, ...)
-    end))
-    
-    -- Hook OnClientEvent e OnClientInvoke via __index
-    local oldIndex = gameMeta.__index
-    RSP.OriginalFunctions.__index = oldIndex
-    
-    hookmetamethod(game, "__index", newcclosure(function(self, key)
-        local result = oldIndex(self, key)
-        
-        if not RSP.Enabled then return result end
-        if checkcaller and checkcaller() then return result end
-        
-        -- Hookar OnClientEvent
-        if typeof(self) == "Instance" and self:IsA("RemoteEvent") and key == "OnClientEvent" then
-            if RSP.Settings.ShowOnClientEvent then
-                -- Wrap o connect para logar
-                local wrappedSignal = setmetatable({}, {
-                    __index = result,
-                    __newindex = result,
-                    __namecall = function(sig, ...)
-                        local method2 = getnamecallmethod()
-                        if method2 == "Connect" or method2 == "connect" then
-                            local connectArgs = {...}
-                            local originalCallback = connectArgs[1]
-                            if type(originalCallback) == "function" then
-                                connectArgs[1] = function(...)
-                                    local cbArgs = {...}
-                                    local path = getFullPath(self)
-                                    addLog({
-                                        type = "OnClientEvent",
-                                        remoteType = "RemoteEvent",
-                                        remoteName = self.Name,
-                                        remotePath = path,
-                                        remote = self,
-                                        args = cbArgs,
-                                        argsFormatted = formatArgs(cbArgs),
-                                        blocked = false,
-                                        callerScript = nil,
-                                        callerLine = nil,
-                                        direction = "← Client",
-                                    })
-                                    return originalCallback(...)
-                                end
-                            end
-                            return oldIndex(sig, "Connect")(sig, table.unpack(connectArgs))
-                        end
-                        return oldIndex(sig, method2)(sig, ...)
-                    end,
-                })
-                return wrappedSignal
-            end
-        end
-        
-        return result
-    end))
-end
-
--- Método alternativo para exploits sem hookmetamethod
-function setupAlternativeHook()
-    -- Hook via substituição direta nos métodos
-    local originalFireServer = Instance.new("RemoteEvent").FireServer
-    local originalInvokeServer = Instance.new("RemoteFunction").InvokeServer
-    
-    -- Esta abordagem funciona em alguns executores
-    local function hookInstance(instance)
-        if not instance or not instance.Parent then return end
-        
-        if instance:IsA("RemoteEvent") then
-            local orig = instance.FireServer
-            RSP.OriginalFunctions[instance] = RSP.OriginalFunctions[instance] or {}
-            RSP.OriginalFunctions[instance].FireServer = orig
-            
-            -- Sobrescrever (pode não funcionar em todos os exploits)
-            pcall(function()
-                instance.FireServer = function(self, ...)
-                    local args = {...}
-                    local path = getFullPath(self)
-                    if RSP.Enabled and RSP.Settings.ShowFireServer then
-                        addLog({
-                            type = "FireServer",
-                            remoteType = "RemoteEvent",
-                            remoteName = self.Name,
-                            remotePath = path,
-                            remote = self,
-                            args = args,
-                            argsFormatted = formatArgs(args),
-                            blocked = RSP.Blocked[path] or false,
-                            direction = "→ Server",
-                        })
-                        if RSP.Blocked[path] then return end
-                    end
-                    return orig(self, ...)
-                end
-            end)
-        end
-    end
-    
-    -- Escanear workspace e scripts
-    local function scanDescendants(parent)
-        for _, child in ipairs(parent:GetDescendants()) do
-            hookInstance(child)
-        end
-    end
-    
-    pcall(scanDescendants, game)
-    
-    -- Monitorar novos descendants
-    game.DescendantAdded:Connect(function(obj)
-        task.defer(hookInstance, obj)
-    end)
-end
-
--- ============================================================
--- INTERFACE GRÁFICA
--- ============================================================
-
--- Remover UI antiga se existir
-if RSP.UI.ScreenGui then
-    pcall(function() RSP.UI.ScreenGui:Destroy() end)
-end
-
--- Cores do tema
-local Theme = {
-    Background = Color3.fromRGB(15, 15, 20),
-    Surface = Color3.fromRGB(22, 22, 30),
-    SurfaceAlt = Color3.fromRGB(28, 28, 38),
-    Border = Color3.fromRGB(45, 45, 65),
-    Accent = Color3.fromRGB(100, 180, 255),
-    AccentDim = Color3.fromRGB(60, 120, 200),
-    Success = Color3.fromRGB(80, 220, 120),
-    Warning = Color3.fromRGB(255, 190, 60),
-    Error = Color3.fromRGB(255, 80, 80),
-    Text = Color3.fromRGB(220, 220, 235),
-    TextDim = Color3.fromRGB(140, 140, 160),
-    TextMuted = Color3.fromRGB(80, 80, 100),
-    
-    -- Cores por tipo de remote
-    FireServer = Color3.fromRGB(100, 180, 255),
-    InvokeServer = Color3.fromRGB(180, 120, 255),
-    OnClientEvent = Color3.fromRGB(80, 220, 150),
-    OnClientInvoke = Color3.fromRGB(150, 255, 180),
-    Fire = Color3.fromRGB(255, 160, 60),
-    Invoke = Color3.fromRGB(255, 120, 80),
-    Blocked = Color3.fromRGB(255, 60, 60),
-}
-
-local function typeColor(logType)
-    return Theme[logType] or Theme.TextDim
-end
-
--- Helpers para criar instâncias
-local function Create(className, properties, children)
-    local inst = Instance.new(className)
-    for k, v in pairs(properties or {}) do
-        if k ~= "Parent" then
-            inst[k] = v
-        end
-    end
-    for _, child in ipairs(children or {}) do
-        if child then child.Parent = inst end
-    end
-    if properties and properties.Parent then
-        inst.Parent = properties.Parent
-    end
-    return inst
-end
-
-local function Label(text, size, color, font, props)
-    local p = props or {}
-    p.Text = text
-    p.TextSize = size or 13
-    p.TextColor3 = color or Theme.Text
-    p.Font = font or Enum.Font.Gotham
-    p.BackgroundTransparency = p.BackgroundTransparency ~= nil and p.BackgroundTransparency or 1
-    p.TextXAlignment = p.TextXAlignment or Enum.TextXAlignment.Left
-    return Create("TextLabel", p)
-end
-
-local function Button(text, size, props, children)
-    local p = props or {}
-    p.Text = text
-    p.TextSize = size or 13
-    p.Font = p.Font or Enum.Font.GothamBold
-    p.TextColor3 = p.TextColor3 or Theme.Text
-    p.BackgroundColor3 = p.BackgroundColor3 or Theme.SurfaceAlt
-    p.BorderSizePixel = 0
-    p.AutoButtonColor = false
-    local btn = Create("TextButton", p, children)
-    
-    btn.MouseEnter:Connect(function()
-        TweenService:Create(btn, TweenInfo.new(0.12), {
-            BackgroundColor3 = Color3.new(
-                math.min(1, btn.BackgroundColor3.R + 0.08),
-                math.min(1, btn.BackgroundColor3.G + 0.08),
-                math.min(1, btn.BackgroundColor3.B + 0.08)
-            )
-        }):Play()
-    end)
-    btn.MouseLeave:Connect(function()
-        TweenService:Create(btn, TweenInfo.new(0.12), {
-            BackgroundColor3 = p.BackgroundColor3
-        }):Play()
-    end)
-    
-    return btn
-end
-
-local function Divider(props)
-    local p = props or {}
-    p.BackgroundColor3 = p.BackgroundColor3 or Theme.Border
-    p.BorderSizePixel = 0
-    p.Size = p.Size or UDim2.new(1, 0, 0, 1)
-    return Create("Frame", p)
-end
-
-local function Corner(radius)
-    return Create("UICorner", { CornerRadius = UDim.new(0, radius or 6) })
-end
-
-local function Padding(v, h)
-    return Create("UIPadding", {
-        PaddingTop = UDim.new(0, v or 6),
-        PaddingBottom = UDim.new(0, v or 6),
-        PaddingLeft = UDim.new(0, h or 8),
-        PaddingRight = UDim.new(0, h or 8),
-    })
-end
-
--- ============================================================
--- CRIAR INTERFACE
--- ============================================================
-
--- ScreenGui
-local ScreenGui = Create("ScreenGui", {
-    Name = "RemoteSpyPro",
-    ResetOnSpawn = false,
-    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
-    DisplayOrder = 9999,
-})
-
-pcall(function()
-    ScreenGui.Parent = CoreGui
-end)
-if not ScreenGui.Parent then
-    ScreenGui.Parent = LocalPlayer.PlayerGui
-end
-
-RSP.UI.ScreenGui = ScreenGui
-
--- Janela principal
-local MainFrame = Create("Frame", {
-    Name = "Main",
-    Size = UDim2.new(0, 720, 0, 500),
-    Position = UDim2.new(0.5, -360, 0.5, -250),
-    BackgroundColor3 = Theme.Background,
-    BorderSizePixel = 0,
-    Parent = ScreenGui,
-}, {
-    Corner(10),
-    Create("UIStroke", { Color = Theme.Border, Thickness = 1.5 }),
-})
-
-RSP.UI.MainFrame = MainFrame
-
--- Sombra
-local Shadow = Create("ImageLabel", {
-    Name = "Shadow",
-    AnchorPoint = Vector2.new(0.5, 0.5),
-    BackgroundTransparency = 1,
-    Position = UDim2.new(0.5, 0, 0.5, 8),
-    Size = UDim2.new(1, 40, 1, 40),
-    ZIndex = -1,
-    Image = "rbxassetid://6014261993",
-    ImageColor3 = Color3.new(0, 0, 0),
-    ImageTransparency = 0.5,
-    ScaleType = Enum.ScaleType.Slice,
-    SliceCenter = Rect.new(49, 49, 450, 450),
-    Parent = MainFrame,
-})
-
--- Header (drag bar)
-local Header = Create("Frame", {
-    Name = "Header",
-    Size = UDim2.new(1, 0, 0, 40),
-    BackgroundColor3 = Theme.Surface,
-    BorderSizePixel = 0,
-    Parent = MainFrame,
-}, {
-    Corner(10),
-})
-
--- Corrigir cantos inferiores do header
-Create("Frame", {
-    Size = UDim2.new(1, 0, 0, 10),
-    Position = UDim2.new(0, 0, 1, -10),
-    BackgroundColor3 = Theme.Surface,
-    BorderSizePixel = 0,
-    Parent = Header,
-})
-
--- Logo / Título
-local TitleContainer = Create("Frame", {
-    Size = UDim2.new(1, -120, 1, 0),
-    BackgroundTransparency = 1,
-    Parent = Header,
-})
-
-Create("Frame", {
-    Name = "Dot",
-    Size = UDim2.new(0, 8, 0, 8),
-    Position = UDim2.new(0, 14, 0.5, -4),
-    BackgroundColor3 = Theme.Accent,
-    BorderSizePixel = 0,
-    Parent = TitleContainer,
-}, { Corner(4) })
-
-Create("Frame", {
-    Name = "Dot2",
-    Size = UDim2.new(0, 8, 0, 8),
-    Position = UDim2.new(0, 26, 0.5, -4),
-    BackgroundColor3 = Theme.AccentDim,
-    BorderSizePixel = 0,
-    Parent = TitleContainer,
-}, { Corner(4) })
-
-Label("Remote Spy Pro", 14, Theme.Text, Enum.Font.GothamBold, {
-    Position = UDim2.new(0, 44, 0, 0),
-    Size = UDim2.new(0, 200, 1, 0),
-    TextXAlignment = Enum.TextXAlignment.Left,
-    Parent = TitleContainer,
-})
-
-Label("v" .. RSP.Version, 11, Theme.TextMuted, Enum.Font.Gotham, {
-    Position = UDim2.new(0, 180, 0, 0),
-    Size = UDim2.new(0, 60, 1, 0),
-    TextXAlignment = Enum.TextXAlignment.Left,
-    Parent = TitleContainer,
-})
-
--- Botões de controle do header
-local HeaderButtons = Create("Frame", {
-    Size = UDim2.new(0, 110, 1, 0),
-    Position = UDim2.new(1, -110, 0, 0),
-    BackgroundTransparency = 1,
-    Parent = Header,
-})
-
-local function HeaderBtn(text, color, xPos)
-    local btn = Create("TextButton", {
-        Text = text,
-        TextSize = 11,
-        Font = Enum.Font.GothamBold,
-        TextColor3 = color,
-        Size = UDim2.new(0, 30, 0, 20),
-        Position = UDim2.new(0, xPos, 0.5, -10),
-        BackgroundColor3 = Theme.SurfaceAlt,
-        BorderSizePixel = 0,
-        Parent = HeaderButtons,
-    }, { Corner(5) })
-    return btn
-end
-
-local MinBtn = HeaderBtn("—", Theme.TextDim, 8)
-local ToggleBtn = HeaderBtn("●", Theme.Success, 42)
-local CloseBtn = HeaderBtn("✕", Theme.Error, 76)
-
--- Toggle visibilidade
-local minimized = false
-MinBtn.MouseButton1Click:Connect(function()
-    minimized = not minimized
-    local targetSize = minimized and UDim2.new(0, 720, 0, 40) or UDim2.new(0, 720, 0, 500)
-    TweenService:Create(MainFrame, TweenInfo.new(0.25, Enum.EasingStyle.Quart), {
-        Size = targetSize
-    }):Play()
-end)
-
--- Toggle espionagem
-ToggleBtn.MouseButton1Click:Connect(function()
-    RSP.Enabled = not RSP.Enabled
-    ToggleBtn.TextColor3 = RSP.Enabled and Theme.Success or Theme.Error
-    ToggleBtn.Text = RSP.Enabled and "●" or "○"
-end)
-
-CloseBtn.MouseButton1Click:Connect(function()
-    TweenService:Create(MainFrame, TweenInfo.new(0.2), { Size = UDim2.new(0, 0, 0, 0) }):Play()
-    task.delay(0.25, function()
-        ScreenGui:Destroy()
-    end)
-end)
-
--- ============================================================
--- ABAS
--- ============================================================
-
-local TabBar = Create("Frame", {
-    Name = "TabBar",
-    Size = UDim2.new(1, 0, 0, 34),
-    Position = UDim2.new(0, 0, 0, 40),
-    BackgroundColor3 = Theme.Surface,
-    BorderSizePixel = 0,
-    Parent = MainFrame,
-}, {
-    Create("UIListLayout", {
-        FillDirection = Enum.FillDirection.Horizontal,
-        SortOrder = Enum.SortOrder.LayoutOrder,
-        VerticalAlignment = Enum.VerticalAlignment.Center,
-        Padding = UDim.new(0, 2),
-    }),
-    Padding(0, 6),
-})
-
-local tabIndicator = Create("Frame", {
-    Name = "Indicator",
-    Size = UDim2.new(0, 60, 0, 2),
-    Position = UDim2.new(0, 6, 1, -2),
-    BackgroundColor3 = Theme.Accent,
-    BorderSizePixel = 0,
-    Parent = TabBar,
-}, { Corner(2) })
-
-local tabs = {}
-local tabFrames = {}
-
-local function createTab(name, icon, order)
-    local btn = Create("TextButton", {
-        Text = icon .. " " .. name,
-        TextSize = 12,
-        Font = Enum.Font.GothamBold,
-        TextColor3 = Theme.TextDim,
-        Size = UDim2.new(0, 90, 1, -4),
-        BackgroundTransparency = 1,
-        BorderSizePixel = 0,
-        LayoutOrder = order,
-        Parent = TabBar,
-    })
-    tabs[name] = btn
-    return btn
-end
-
-local LogsTabBtn = createTab("Logs", "📋", 1)
-local RemotesTabBtn = createTab("Remotes", "📡", 2)
-local BlockedTabBtn = createTab("Blocked", "🚫", 3)
-local SettingsTabBtn = createTab("Config", "⚙", 4)
-
--- Conteúdo principal
-local ContentArea = Create("Frame", {
-    Name = "Content",
-    Size = UDim2.new(1, 0, 1, -74),
-    Position = UDim2.new(0, 0, 0, 74),
-    BackgroundTransparency = 1,
-    ClipsDescendants = true,
-    Parent = MainFrame,
-})
-
-local function createTabFrame(name)
-    local frame = Create("Frame", {
-        Name = name,
-        Size = UDim2.new(1, 0, 1, 0),
-        BackgroundTransparency = 1,
-        Visible = false,
-        Parent = ContentArea,
-    })
-    tabFrames[name] = frame
-    return frame
-end
-
-local LogsFrame = createTabFrame("Logs")
-local RemotesFrame = createTabFrame("Remotes")
-local BlockedFrame = createTabFrame("Blocked")
-local SettingsFrame = createTabFrame("Settings")
-
-local function switchTab(name)
-    RSP.CurrentTab = name
-    for tabName, frame in pairs(tabFrames) do
-        frame.Visible = tabName == name
-    end
-    for tabName, btn in pairs(tabs) do
-        btn.TextColor3 = tabName == name and Theme.Accent or Theme.TextDim
-    end
-end
-
-LogsTabBtn.MouseButton1Click:Connect(function() switchTab("Logs") end)
-RemotesTabBtn.MouseButton1Click:Connect(function() switchTab("Remotes") end)
-BlockedTabBtn.MouseButton1Click:Connect(function() switchTab("Blocked") end)
-SettingsTabBtn.MouseButton1Click:Connect(function() switchTab("Settings") end)
-
--- ============================================================
--- ABA: LOGS
--- ============================================================
-
--- Barra de ferramentas de logs
-local LogsToolbar = Create("Frame", {
-    Size = UDim2.new(1, 0, 0, 36),
-    BackgroundColor3 = Theme.Surface,
-    BorderSizePixel = 0,
-    Parent = LogsFrame,
-}, {
-    Padding(4, 8),
-    Create("UIListLayout", {
-        FillDirection = Enum.FillDirection.Horizontal,
-        VerticalAlignment = Enum.VerticalAlignment.Center,
-        Padding = UDim.new(0, 6),
-    }),
-})
-
--- Campo de busca
-local SearchBox = Create("TextBox", {
-    PlaceholderText = "🔍  Filtrar por nome...",
-    PlaceholderColor3 = Theme.TextMuted,
-    Text = "",
-    TextSize = 12,
-    Font = Enum.Font.Gotham,
-    TextColor3 = Theme.Text,
-    Size = UDim2.new(0, 200, 0, 26),
-    BackgroundColor3 = Theme.SurfaceAlt,
-    BorderSizePixel = 0,
-    TextXAlignment = Enum.TextXAlignment.Left,
-    ClearTextOnFocus = false,
-    Parent = LogsToolbar,
-}, {
-    Corner(6),
-    Padding(0, 8),
-    Create("UIStroke", { Color = Theme.Border, Thickness = 1 }),
-})
-
-SearchBox:GetPropertyChangedSignal("Text"):Connect(function()
-    RSP.Filter = SearchBox.Text:lower()
-end)
-
--- Botão limpar
-local ClearBtn = Button("🗑 Limpar", 11, {
-    Size = UDim2.new(0, 75, 0, 26),
-    BackgroundColor3 = Theme.SurfaceAlt,
-    Parent = LogsToolbar,
-}, { Corner(6) })
-
-ClearBtn.MouseButton1Click:Connect(function()
-    RSP.Logs = {}
-    RSP.Stats = {}
-end)
-
--- Status
-local LogCountLabel = Label("0 logs", 11, Theme.TextMuted, Enum.Font.Gotham, {
-    Size = UDim2.new(0, 80, 0, 26),
-    TextXAlignment = Enum.TextXAlignment.Right,
-    Parent = LogsToolbar,
-})
-
--- Separador
-Divider({ Position = UDim2.new(0, 0, 0, 36), Parent = LogsFrame })
-
--- Painel principal de logs (esquerda) + detalhes (direita)
-local LogSplit = Create("Frame", {
-    Size = UDim2.new(1, 0, 1, -37),
-    Position = UDim2.new(0, 0, 0, 37),
-    BackgroundTransparency = 1,
-    Parent = LogsFrame,
-})
-
--- Lista de logs
-local LogListContainer = Create("Frame", {
-    Size = UDim2.new(0, 430, 1, 0),
-    BackgroundTransparency = 1,
-    Parent = LogSplit,
-})
-
-local LogScrollFrame = Create("ScrollingFrame", {
-    Size = UDim2.new(1, 0, 1, 0),
-    BackgroundTransparency = 1,
-    BorderSizePixel = 0,
-    ScrollBarThickness = 4,
-    ScrollBarImageColor3 = Theme.Border,
-    CanvasSize = UDim2.new(0, 0, 0, 0),
-    AutomaticCanvasSize = Enum.AutomaticSize.Y,
-    Parent = LogListContainer,
-})
-
-local LogList = Create("Frame", {
-    Size = UDim2.new(1, 0, 0, 0),
-    AutomaticSize = Enum.AutomaticSize.Y,
-    BackgroundTransparency = 1,
-    Parent = LogScrollFrame,
-}, {
-    Create("UIListLayout", {
-        SortOrder = Enum.SortOrder.LayoutOrder,
-        Padding = UDim.new(0, 1),
-    }),
-})
-
--- Separador vertical
-Divider({
-    Size = UDim2.new(0, 1, 1, 0),
-    Position = UDim2.new(0, 430, 0, 0),
-    Parent = LogSplit,
-})
-
--- Painel de detalhes
-local DetailPanel = Create("Frame", {
-    Size = UDim2.new(1, -431, 1, 0),
-    Position = UDim2.new(0, 431, 0, 0),
-    BackgroundTransparency = 1,
-    Parent = LogSplit,
-})
-
-local DetailScroll = Create("ScrollingFrame", {
-    Size = UDim2.new(1, 0, 1, 0),
-    BackgroundTransparency = 1,
-    BorderSizePixel = 0,
-    ScrollBarThickness = 4,
-    ScrollBarImageColor3 = Theme.Border,
-    CanvasSize = UDim2.new(0, 0, 0, 0),
-    AutomaticCanvasSize = Enum.AutomaticSize.Y,
-    Parent = DetailPanel,
-})
-
-local DetailContent = Create("Frame", {
-    Size = UDim2.new(1, 0, 0, 0),
-    AutomaticSize = Enum.AutomaticSize.Y,
-    BackgroundTransparency = 1,
-    Parent = DetailScroll,
-}, {
-    Padding(8, 10),
-    Create("UIListLayout", {
-        SortOrder = Enum.SortOrder.LayoutOrder,
-        Padding = UDim.new(0, 6),
-    }),
-})
-
-local function clearDetail()
-    for _, child in ipairs(DetailContent:GetChildren()) do
-        if not child:IsA("UIListLayout") and not child:IsA("UIPadding") then
-            child:Destroy()
-        end
-    end
-end
-
-local function DetailRow(key, value, color, order)
-    local row = Create("Frame", {
-        Size = UDim2.new(1, 0, 0, 0),
-        AutomaticSize = Enum.AutomaticSize.Y,
-        BackgroundTransparency = 1,
-        LayoutOrder = order or 0,
-        Parent = DetailContent,
-    })
-    Label(key, 10, Theme.TextMuted, Enum.Font.GothamBold, {
-        Size = UDim2.new(1, 0, 0, 16),
-        Parent = row,
-    })
-    Label(value, 11, color or Theme.Text, Enum.Font.Code, {
-        Size = UDim2.new(1, 0, 0, 0),
-        AutomaticSize = Enum.AutomaticSize.Y,
-        Position = UDim2.new(0, 0, 0, 16),
-        TextWrapped = true,
-        TextXAlignment = Enum.TextXAlignment.Left,
-        Parent = row,
-    })
-    return row
-end
-
-local function showLogDetail(log)
-    clearDetail()
-    RSP.SelectedLog = log
-    
-    -- Header do detail
-    local typeColor = typeColor(log.type)
-    
-    -- Tipo + direção
-    local headerRow = Create("Frame", {
-        Size = UDim2.new(1, 0, 0, 32),
-        BackgroundColor3 = Theme.SurfaceAlt,
-        BorderSizePixel = 0,
-        LayoutOrder = 0,
-        Parent = DetailContent,
-    }, {
-        Corner(6),
-        Padding(6, 10),
-    })
-    
-    Label(log.type, 13, typeColor, Enum.Font.GothamBold, {
-        Size = UDim2.new(0.5, 0, 1, 0),
-        Parent = headerRow,
-    })
-    Label(log.direction or "", 11, Theme.TextMuted, Enum.Font.Gotham, {
-        Size = UDim2.new(0.5, 0, 1, 0),
-        Position = UDim2.new(0.5, 0, 0, 0),
-        TextXAlignment = Enum.TextXAlignment.Right,
-        Parent = headerRow,
-    })
-    
-    -- Informações
-    DetailRow("⏰ Timestamp", log.timestamp or "?", Theme.TextDim, 1)
-    DetailRow("📡 Remote", log.remoteName or "?", Theme.Accent, 2)
-    DetailRow("📁 Path", log.remotePath or "?", Theme.TextDim, 3)
-    DetailRow("🔷 Tipo", log.remoteType or "?", typeColor, 4)
-    
-    if log.callerScript then
-        DetailRow("📜 Script", log.callerScript, Theme.Warning, 5)
-    end
-    if log.callerLine then
-        DetailRow("📍 Linha", tostring(log.callerLine), Theme.Warning, 6)
-    end
-    
-    if log.blocked then
-        DetailRow("🚫 Status", "BLOQUEADO", Theme.Error, 7)
-    end
-    
-    -- Args
-    local argsRow = Create("Frame", {
-        Size = UDim2.new(1, 0, 0, 0),
-        AutomaticSize = Enum.AutomaticSize.Y,
-        BackgroundTransparency = 1,
-        LayoutOrder = 8,
-        Parent = DetailContent,
-    })
-    
-    Label("📦 Argumentos", 10, Theme.TextMuted, Enum.Font.GothamBold, {
-        Size = UDim2.new(1, 0, 0, 16),
-        Parent = argsRow,
-    })
-    
-    if log.args and #log.args > 0 then
-        for i, arg in ipairs(log.args) do
-            if i > RSP.Settings.MaxArgs then break end
-            local argBg = Create("Frame", {
-                Size = UDim2.new(1, 0, 0, 0),
-                AutomaticSize = Enum.AutomaticSize.Y,
-                BackgroundColor3 = Theme.SurfaceAlt,
-                BorderSizePixel = 0,
-                LayoutOrder = i,
-                Parent = argsRow,
-            }, {
-                Corner(4),
-                Padding(4, 8),
-            })
-            
-            local argType = typeof(arg)
-            Label(string.format("[%d] %s", i, argType), 9, Theme.TextMuted, Enum.Font.GothamBold, {
-                Size = UDim2.new(1, 0, 0, 14),
-                Parent = argBg,
-            })
-            Label(formatValue(arg), 11, Theme.Text, Enum.Font.Code, {
-                Size = UDim2.new(1, 0, 0, 0),
-                AutomaticSize = Enum.AutomaticSize.Y,
-                Position = UDim2.new(0, 0, 0, 14),
-                TextWrapped = true,
-                TextXAlignment = Enum.TextXAlignment.Left,
-                Parent = argBg,
-            })
-        end
-    else
-        Label("(sem argumentos)", 11, Theme.TextMuted, Enum.Font.Gotham, {
-            Size = UDim2.new(1, 0, 0, 20),
-            Position = UDim2.new(0, 0, 0, 16),
-            Parent = argsRow,
-        })
-    end
-    
-    -- Botões de ação
-    local ActionsRow = Create("Frame", {
-        Size = UDim2.new(1, 0, 0, 60),
-        BackgroundTransparency = 1,
-        LayoutOrder = 9,
-        Parent = DetailContent,
-    }, {
-        Create("UIListLayout", {
-            FillDirection = Enum.FillDirection.Horizontal,
-            Padding = UDim.new(0, 6),
-            VerticalAlignment = Enum.VerticalAlignment.Center,
-        }),
-    })
-    
-    -- Copiar script
-    local CopyScriptBtn = Button("📋 Copiar Script", 11, {
-        Size = UDim2.new(0, 120, 0, 28),
-        BackgroundColor3 = Theme.AccentDim,
-        TextColor3 = Theme.Text,
-        Parent = ActionsRow,
-    }, { Corner(6) })
-    
-    CopyScriptBtn.MouseButton1Click:Connect(function()
-        local path = log.remotePath or log.remoteName
-        local code
-        if log.type == "FireServer" then
-            code = string.format(
-                '-- RemoteSpy Pro - %s\nlocal remote = game:GetService("ReplicatedStorage"):FindFirstChild("%s", true)\nif remote then\n    remote:FireServer(%s)\nend',
-                log.timestamp, log.remoteName, argsToLua(log.args)
-            )
-        elseif log.type == "InvokeServer" then
-            code = string.format(
-                '-- RemoteSpy Pro - %s\nlocal remote = game:GetService("ReplicatedStorage"):FindFirstChild("%s", true)\nif remote then\n    local result = remote:InvokeServer(%s)\nend',
-                log.timestamp, log.remoteName, argsToLua(log.args)
-            )
-        else
-            code = string.format(
-                '-- RemoteSpy Pro - %s [%s]\n-- Path: %s\n-- Args: %s',
-                log.timestamp, log.type, path, log.argsFormatted
-            )
-        end
-        
-        if setclipboard then
-            setclipboard(code)
-            CopyScriptBtn.Text = "✅ Copiado!"
-            task.delay(1.5, function()
-                CopyScriptBtn.Text = "📋 Copiar Script"
-            end)
-        end
-    end)
-    
-    -- Bloquear/desbloquear
-    local path = log.remotePath
-    local isBlocked = RSP.Blocked[path]
-    local BlockToggleBtn = Button(isBlocked and "✅ Desbloquear" or "🚫 Bloquear", 11, {
-        Size = UDim2.new(0, 110, 0, 28),
-        BackgroundColor3 = isBlocked and Theme.Success or Theme.Error,
-        TextColor3 = Theme.Text,
-        Parent = ActionsRow,
-    }, { Corner(6) })
-    
-    BlockToggleBtn.MouseButton1Click:Connect(function()
-        if RSP.Blocked[path] then
-            RSP.Blocked[path] = nil
-            BlockToggleBtn.Text = "🚫 Bloquear"
-            BlockToggleBtn.BackgroundColor3 = Theme.Error
-        else
-            RSP.Blocked[path] = true
-            BlockToggleBtn.Text = "✅ Desbloquear"
-            BlockToggleBtn.BackgroundColor3 = Theme.Success
-        end
-    end)
-end
-
--- ============================================================
--- RENDERIZAÇÃO DOS LOGS
--- ============================================================
-
-local logEntries = {}
-local lastLogCount = 0
-
-local function createLogEntry(log)
-    local color = typeColor(log.type)
-    
-    local entry = Create("TextButton", {
-        Name = "Log_" .. log.id,
-        Size = UDim2.new(1, 0, 0, 36),
-        BackgroundColor3 = Theme.Surface,
-        BorderSizePixel = 0,
-        Text = "",
-        AutoButtonColor = false,
-        LayoutOrder = log.id,
-        Parent = LogList,
-    })
-    
-    -- Borda esquerda colorida
-    Create("Frame", {
-        Size = UDim2.new(0, 3, 1, 0),
-        BackgroundColor3 = log.blocked and Theme.Error or color,
-        BorderSizePixel = 0,
-        Parent = entry,
-    }, { Corner(2) })
-    
-    -- Tag de tipo
-    local tag = Create("Frame", {
-        Size = UDim2.new(0, 90, 0, 18),
-        Position = UDim2.new(0, 10, 0.5, -9),
-        BackgroundColor3 = Color3.new(color.R * 0.2, color.G * 0.2, color.B * 0.2),
-        BorderSizePixel = 0,
-        Parent = entry,
-    }, {
-        Corner(4),
-        Label(log.type, 10, color, Enum.Font.GothamBold, {
-            Size = UDim2.new(1, 0, 1, 0),
-            TextXAlignment = Enum.TextXAlignment.Center,
-        })
-    })
-    
-    -- Nome do remote
-    Label(log.remoteName or "?", 12, Theme.Text, Enum.Font.GothamBold, {
-        Size = UDim2.new(1, -280, 1, 0),
-        Position = UDim2.new(0, 108, 0, 0),
-        TextTruncate = Enum.TextTruncate.AtEnd,
-        Parent = entry,
-    })
-    
-    -- Timestamp
-    Label(log.timestamp or "", 10, Theme.TextMuted, Enum.Font.Gotham, {
-        Size = UDim2.new(0, 60, 1, 0),
-        Position = UDim2.new(1, -68, 0, 0),
-        TextXAlignment = Enum.TextXAlignment.Right,
-        Parent = entry,
-    })
-    
-    -- Ícone de bloqueado
-    if log.blocked then
-        Label("🚫", 12, Theme.Error, Enum.Font.Gotham, {
-            Size = UDim2.new(0, 20, 1, 0),
-            Position = UDim2.new(1, -88, 0, 0),
-            TextXAlignment = Enum.TextXAlignment.Center,
-            Parent = entry,
-        })
-    end
-    
-    entry.MouseButton1Click:Connect(function()
-        -- Destacar selecionado
-        for _, e in ipairs(LogList:GetChildren()) do
-            if e:IsA("TextButton") then
-                e.BackgroundColor3 = Theme.Surface
-            end
-        end
-        entry.BackgroundColor3 = Theme.SurfaceAlt
-        showLogDetail(log)
-    end)
-    
-    entry.MouseEnter:Connect(function()
-        if RSP.SelectedLog ~= log then
-            TweenService:Create(entry, TweenInfo.new(0.1), {
-                BackgroundColor3 = Color3.new(
-                    Theme.Surface.R + 0.04,
-                    Theme.Surface.G + 0.04,
-                    Theme.Surface.B + 0.04
-                )
-            }):Play()
-        end
-    end)
-    entry.MouseLeave:Connect(function()
-        if RSP.SelectedLog ~= log then
-            TweenService:Create(entry, TweenInfo.new(0.1), {
-                BackgroundColor3 = Theme.Surface
-            }):Play()
-        end
-    end)
-    
-    return entry
-end
-
--- Atualizar lista de logs
-onNewLog(function(log)
-    -- Verificar filtro
-    local filter = RSP.Filter
-    if filter ~= "" then
-        local name = (log.remoteName or ""):lower()
-        local path = (log.remotePath or ""):lower()
-        if not name:find(filter, 1, true) and not path:find(filter, 1, true) then
-            return
-        end
-    end
-    
-    -- Verificar configurações de tipo
-    if log.type == "FireServer" and not RSP.Settings.ShowFireServer then return end
-    if log.type == "InvokeServer" and not RSP.Settings.ShowInvokeServer then return end
-    if log.type == "OnClientEvent" and not RSP.Settings.ShowOnClientEvent then return end
-    if log.type == "OnClientInvoke" and not RSP.Settings.ShowOnClientInvoke then return end
-    if (log.type == "Fire" or log.type == "Invoke") and not RSP.Settings.ShowBindables then return end
-    
-    -- Criar entrada
-    local entry = createLogEntry(log)
-    table.insert(logEntries, entry)
-    
-    -- Remover entradas antigas da UI se necessário
-    while #logEntries > RSP.MaxLogs do
-        local old = table.remove(logEntries, 1)
-        if old and old.Parent then
-            old:Destroy()
-        end
-    end
-    
-    -- Auto scroll
-    if RSP.Settings.AutoScroll then
-        task.defer(function()
-            LogScrollFrame.CanvasPosition = Vector2.new(0, LogScrollFrame.AbsoluteCanvasSize.Y)
-        end)
-    end
-    
-    -- Atualizar contador
-    LogCountLabel.Text = #RSP.Logs .. " logs"
-end)
-
--- Reconstruir lista quando filtro mudar
-local lastFilter = ""
-RunService.Heartbeat:Connect(function()
-    if RSP.Filter ~= lastFilter then
-        lastFilter = RSP.Filter
-        -- Limpar e recriar com filtro
-        for _, child in ipairs(LogList:GetChildren()) do
-            if child:IsA("TextButton") then
-                child:Destroy()
-            end
-        end
-        logEntries = {}
-        
-        for _, log in ipairs(RSP.Logs) do
-            local filter = RSP.Filter
-            if filter == "" then
-                createLogEntry(log)
-            else
-                local name = (log.remoteName or ""):lower()
-                local path = (log.remotePath or ""):lower()
-                if name:find(filter, 1, true) or path:find(filter, 1, true) then
-                    createLogEntry(log)
-                end
-            end
-        end
-    end
-end)
-
--- ============================================================
--- ABA: REMOTES (lista de todos os remotes encontrados)
--- ============================================================
-
-local RemotesList = Create("ScrollingFrame", {
-    Size = UDim2.new(1, 0, 1, 0),
-    BackgroundTransparency = 1,
-    BorderSizePixel = 0,
-    ScrollBarThickness = 4,
-    ScrollBarImageColor3 = Theme.Border,
-    CanvasSize = UDim2.new(0, 0, 0, 0),
-    AutomaticCanvasSize = Enum.AutomaticSize.Y,
-    Parent = RemotesFrame,
-})
-
-local RemotesListContent = Create("Frame", {
-    Size = UDim2.new(1, 0, 0, 0),
-    AutomaticSize = Enum.AutomaticSize.Y,
-    BackgroundTransparency = 1,
-    Parent = RemotesList,
-}, {
-    Create("UIListLayout", {
-        SortOrder = Enum.SortOrder.Name,
-        Padding = UDim.new(0, 1),
-    }),
-    Padding(6, 8),
-})
-
-local function refreshRemotesList()
-    for _, child in ipairs(RemotesListContent:GetChildren()) do
-        if child:IsA("Frame") then
-            child:Destroy()
-        end
-    end
-    
-    local found = {}
-    
-    local function scanFor(parent)
-        for _, obj in ipairs(parent:GetDescendants()) do
-            local t = obj.ClassName
-            if t == "RemoteEvent" or t == "RemoteFunction" or t == "BindableEvent" or t == "BindableFunction" then
-                local path = getFullPath(obj)
-                if not found[path] then
-                    found[path] = { instance = obj, type = t, path = path }
-                end
-            end
-        end
-    end
-    
-    pcall(scanFor, game:GetService("ReplicatedStorage"))
-    pcall(scanFor, game:GetService("ReplicatedFirst"))
-    pcall(scanFor, workspace)
-    pcall(scanFor, game:GetService("Players").LocalPlayer)
-    
-    -- Também adicionar remotes do histórico de logs
-    for _, log in ipairs(RSP.Logs) do
-        local path = log.remotePath
-        if path and not found[path] then
-            found[path] = {
-                instance = log.remote,
-                type = log.remoteType,
-                path = path,
-                name = log.remoteName,
-                fromLogs = true,
-            }
-        end
-    end
-    
-    local count = 0
-    for path, data in pairs(found) do
-        count = count + 1
-        local stats = RSP.Stats[path] or { calls = 0, blocked = 0 }
-        local isBlocked = RSP.Blocked[path]
-        
-        local colorByType = {
-            RemoteEvent = Theme.FireServer,
-            RemoteFunction = Theme.InvokeServer,
-            BindableEvent = Theme.Fire,
-            BindableFunction = Theme.Invoke,
-        }
-        local typeClr = colorByType[data.type] or Theme.TextDim
-        
-        local row = Create("Frame", {
-            Name = path,
-            Size = UDim2.new(1, 0, 0, 38),
-            BackgroundColor3 = Theme.Surface,
-            BorderSizePixel = 0,
-            Parent = RemotesListContent,
-        }, { Corner(6), Padding(0, 10) })
-        
-        Create("Frame", {
-            Size = UDim2.new(0, 3, 1, 0),
-            BackgroundColor3 = isBlocked and Theme.Error or typeClr,
-            BorderSizePixel = 0,
-            Parent = row,
-        }, { Corner(2) })
-        
-        Label(data.name or (data.instance and data.instance.Name) or "?", 12, Theme.Text, Enum.Font.GothamBold, {
-            Size = UDim2.new(0.4, 0, 1, 0),
-            Position = UDim2.new(0, 10, 0, 0),
-            TextTruncate = Enum.TextTruncate.AtEnd,
-            Parent = row,
-        })
-        
-        Label(data.type, 10, typeClr, Enum.Font.Gotham, {
-            Size = UDim2.new(0.2, 0, 1, 0),
-            Position = UDim2.new(0.4, 10, 0, 0),
-            Parent = row,
-        })
-        
-        Label(string.format("📞 %d chamadas", stats.calls), 10, Theme.TextDim, Enum.Font.Gotham, {
-            Size = UDim2.new(0.2, 0, 1, 0),
-            Position = UDim2.new(0.6, 0, 0, 0),
-            Parent = row,
-        })
-        
-        local blockBtn = Button(isBlocked and "✅ Permitir" or "🚫 Bloquear", 10, {
-            Size = UDim2.new(0, 80, 0, 22),
-            Position = UDim2.new(1, -85, 0.5, -11),
-            BackgroundColor3 = isBlocked and Theme.Success or Color3.fromRGB(60, 30, 30),
-            TextColor3 = isBlocked and Theme.Background or Theme.Error,
-            Parent = row,
-        }, { Corner(5) })
-        
-        blockBtn.MouseButton1Click:Connect(function()
-            if RSP.Blocked[path] then
-                RSP.Blocked[path] = nil
-                blockBtn.Text = "🚫 Bloquear"
-                blockBtn.BackgroundColor3 = Color3.fromRGB(60, 30, 30)
-                blockBtn.TextColor3 = Theme.Error
-                row:FindFirstChild("Frame").BackgroundColor3 = typeClr
-            else
-                RSP.Blocked[path] = true
-                blockBtn.Text = "✅ Permitir"
-                blockBtn.BackgroundColor3 = Theme.Success
-                blockBtn.TextColor3 = Theme.Background
-                row:FindFirstChild("Frame").BackgroundColor3 = Theme.Error
-            end
-        end)
-    end
-    
-    if count == 0 then
-        Label("Nenhum remote encontrado.\nDispare alguns eventos primeiro.", 12, Theme.TextMuted, Enum.Font.Gotham, {
-            Size = UDim2.new(1, 0, 0, 60),
-            TextXAlignment = Enum.TextXAlignment.Center,
-            TextWrapped = true,
-            Parent = RemotesListContent,
-        })
-    end
-end
-
--- Botão refresh remotes
-local RemotesHeader = Create("Frame", {
-    Size = UDim2.new(1, 0, 0, 36),
-    BackgroundColor3 = Theme.Surface,
-    BorderSizePixel = 0,
-    Parent = RemotesFrame,
-}, {
-    Padding(4, 8),
-    Create("UIListLayout", {
-        FillDirection = Enum.FillDirection.Horizontal,
-        VerticalAlignment = Enum.VerticalAlignment.Center,
-        Padding = UDim.new(0, 6),
-    }),
-})
-
-Label("Remotes detectados no jogo", 12, Theme.TextDim, Enum.Font.GothamBold, {
-    Size = UDim2.new(1, -100, 0, 26),
-    Parent = RemotesHeader,
-})
-
-local RefreshBtn = Button("🔄 Atualizar", 11, {
-    Size = UDim2.new(0, 90, 0, 26),
-    BackgroundColor3 = Theme.AccentDim,
-    Parent = RemotesHeader,
-}, { Corner(6) })
-
-RefreshBtn.MouseButton1Click:Connect(function()
-    refreshRemotesList()
-end)
-
-RemotesTabBtn.MouseButton1Click:Connect(function()
-    refreshRemotesList()
-end)
-
--- ============================================================
--- ABA: BLOCKED
--- ============================================================
-
-local BlockedHeader = Create("Frame", {
-    Size = UDim2.new(1, 0, 0, 36),
-    BackgroundColor3 = Theme.Surface,
-    BorderSizePixel = 0,
-    Parent = BlockedFrame,
-}, {
-    Padding(4, 8),
-    Create("UIListLayout", {
-        FillDirection = Enum.FillDirection.Horizontal,
-        VerticalAlignment = Enum.VerticalAlignment.Center,
-        Padding = UDim.new(0, 6),
-    }),
-})
-
-Label("Remotes bloqueados", 12, Theme.TextDim, Enum.Font.GothamBold, {
-    Size = UDim2.new(0.5, 0, 0, 26),
-    Parent = BlockedHeader,
-})
-
-local UnblockAllBtn = Button("🔓 Desbloquear Todos", 11, {
-    Size = UDim2.new(0, 150, 0, 26),
-    BackgroundColor3 = Color3.fromRGB(60, 40, 20),
-    TextColor3 = Theme.Warning,
-    Parent = BlockedHeader,
-}, { Corner(6) })
-
-UnblockAllBtn.MouseButton1Click:Connect(function()
-    RSP.Blocked = {}
-    refreshBlockedList()
-end)
-
-local BlockedScroll = Create("ScrollingFrame", {
-    Size = UDim2.new(1, 0, 1, -37),
-    Position = UDim2.new(0, 0, 0, 37),
-    BackgroundTransparency = 1,
-    BorderSizePixel = 0,
-    ScrollBarThickness = 4,
-    ScrollBarImageColor3 = Theme.Border,
-    CanvasSize = UDim2.new(0, 0, 0, 0),
-    AutomaticCanvasSize = Enum.AutomaticSize.Y,
-    Parent = BlockedFrame,
-})
-
-local BlockedContent = Create("Frame", {
-    Size = UDim2.new(1, 0, 0, 0),
-    AutomaticSize = Enum.AutomaticSize.Y,
-    BackgroundTransparency = 1,
-    Parent = BlockedScroll,
-}, {
-    Create("UIListLayout", { SortOrder = Enum.SortOrder.Name, Padding = UDim.new(0, 1) }),
-    Padding(6, 8),
-})
-
-function refreshBlockedList()
-    for _, child in ipairs(BlockedContent:GetChildren()) do
-        if child:IsA("Frame") then child:Destroy() end
-    end
-    
-    local hasAny = false
-    for path, _ in pairs(RSP.Blocked) do
-        hasAny = true
-        local row = Create("Frame", {
-            Name = path,
-            Size = UDim2.new(1, 0, 0, 36),
-            BackgroundColor3 = Color3.fromRGB(40, 20, 20),
-            BorderSizePixel = 0,
-            Parent = BlockedContent,
-        }, {
-            Corner(6),
-            Padding(0, 10),
-            Create("UIStroke", { Color = Theme.Error, Thickness = 1, Transparency = 0.7 }),
-        })
-        
-        Label("🚫 " .. path, 11, Theme.Text, Enum.Font.Gotham, {
-            Size = UDim2.new(1, -90, 1, 0),
-            TextTruncate = Enum.TextTruncate.AtEnd,
-            Parent = row,
-        })
-        
-        local ubBtn = Button("✅ Desbloquear", 10, {
-            Size = UDim2.new(0, 85, 0, 22),
-            Position = UDim2.new(1, -88, 0.5, -11),
-            BackgroundColor3 = Theme.Success,
-            TextColor3 = Theme.Background,
-            Parent = row,
-        }, { Corner(5) })
-        
-        ubBtn.MouseButton1Click:Connect(function()
-            RSP.Blocked[path] = nil
-            row:Destroy()
-        end)
-    end
-    
-    if not hasAny then
-        Label("Nenhum remote bloqueado.", 12, Theme.TextMuted, Enum.Font.Gotham, {
-            Size = UDim2.new(1, 0, 0, 40),
-            TextXAlignment = Enum.TextXAlignment.Center,
-            Parent = BlockedContent,
-        })
-    end
-end
-
-BlockedTabBtn.MouseButton1Click:Connect(refreshBlockedList)
-
--- ============================================================
--- ABA: CONFIGURAÇÕES
--- ============================================================
-
-local SettingsScroll = Create("ScrollingFrame", {
-    Size = UDim2.new(1, 0, 1, 0),
-    BackgroundTransparency = 1,
-    BorderSizePixel = 0,
-    ScrollBarThickness = 4,
-    ScrollBarImageColor3 = Theme.Border,
-    CanvasSize = UDim2.new(0, 0, 0, 0),
-    AutomaticCanvasSize = Enum.AutomaticSize.Y,
-    Parent = SettingsFrame,
-})
-
-local SettingsContent = Create("Frame", {
-    Size = UDim2.new(1, 0, 0, 0),
-    AutomaticSize = Enum.AutomaticSize.Y,
-    BackgroundTransparency = 1,
-    Parent = SettingsScroll,
-}, {
-    Create("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 8) }),
-    Padding(10, 14),
-})
-
-local function SectionLabel(text, order)
-    Label(text, 11, Theme.TextMuted, Enum.Font.GothamBold, {
-        Size = UDim2.new(1, 0, 0, 22),
-        LayoutOrder = order,
-        Parent = SettingsContent,
-    })
-end
-
-local function Toggle(label, settingKey, order)
-    local row = Create("Frame", {
-        Size = UDim2.new(1, 0, 0, 34),
-        BackgroundColor3 = Theme.Surface,
-        BorderSizePixel = 0,
-        LayoutOrder = order,
-        Parent = SettingsContent,
-    }, { Corner(6), Padding(0, 10) })
-    
-    Label(label, 12, Theme.Text, Enum.Font.Gotham, {
-        Size = UDim2.new(1, -60, 1, 0),
-        Parent = row,
-    })
-    
-    local isOn = RSP.Settings[settingKey]
-    
-    local toggleBg = Create("Frame", {
-        Size = UDim2.new(0, 40, 0, 20),
-        Position = UDim2.new(1, -45, 0.5, -10),
-        BackgroundColor3 = isOn and Theme.Accent or Theme.Border,
-        BorderSizePixel = 0,
-        Parent = row,
-    }, { Corner(10) })
-    
-    local toggleKnob = Create("Frame", {
-        Size = UDim2.new(0, 14, 0, 14),
-        Position = UDim2.new(isOn and 1 or 0, isOn and -17 or 3, 0.5, -7),
-        BackgroundColor3 = Color3.new(1, 1, 1),
-        BorderSizePixel = 0,
-        Parent = toggleBg,
-    }, { Corner(7) })
-    
-    local toggleBtn = Create("TextButton", {
-        Text = "",
-        Size = UDim2.new(1, 0, 1, 0),
-        BackgroundTransparency = 1,
-        Parent = toggleBg,
-    })
-    
-    toggleBtn.MouseButton1Click:Connect(function()
-        RSP.Settings[settingKey] = not RSP.Settings[settingKey]
-        local on = RSP.Settings[settingKey]
-        TweenService:Create(toggleBg, TweenInfo.new(0.15), {
-            BackgroundColor3 = on and Theme.Accent or Theme.Border
-        }):Play()
-        TweenService:Create(toggleKnob, TweenInfo.new(0.15), {
-            Position = UDim2.new(on and 1 or 0, on and -17 or 3, 0.5, -7)
-        }):Play()
-    end)
-    
-    return row
-end
-
-SectionLabel("── Tipos de Remote ──", 1)
-Toggle("FireServer (RemoteEvent → Server)", "ShowFireServer", 2)
-Toggle("InvokeServer (RemoteFunction → Server)", "ShowInvokeServer", 3)
-Toggle("OnClientEvent (Server → Client)", "ShowOnClientEvent", 4)
-Toggle("OnClientInvoke (Server → Client)", "ShowOnClientInvoke", 5)
-Toggle("Bindables (BindableEvent / BindableFunction)", "ShowBindables", 6)
-
-SectionLabel("── Debug ──", 7)
-Toggle("Registrar Script de Origem", "LogCallerScript", 8)
-Toggle("Registrar Linha de Origem", "LogCallerLine", 9)
-
-SectionLabel("── Interface ──", 10)
-Toggle("Auto Scroll (rolar automático)", "AutoScroll", 11)
-Toggle("Notificações", "ShowNotifications", 12)
-
--- Max args slider simulado
-local maxArgsRow = Create("Frame", {
-    Size = UDim2.new(1, 0, 0, 34),
-    BackgroundColor3 = Theme.Surface,
-    BorderSizePixel = 0,
-    LayoutOrder = 13,
-    Parent = SettingsContent,
-}, { Corner(6), Padding(0, 10) })
-
-Label("Máximo de Argumentos: " .. RSP.Settings.MaxArgs, 12, Theme.Text, Enum.Font.Gotham, {
-    Name = "MaxArgsLabel",
-    Size = UDim2.new(0.6, 0, 1, 0),
-    Parent = maxArgsRow,
-})
-
-local decBtn = Button("−", 13, {
-    Size = UDim2.new(0, 28, 0, 22),
-    Position = UDim2.new(1, -65, 0.5, -11),
-    BackgroundColor3 = Theme.SurfaceAlt,
-    Parent = maxArgsRow,
-}, { Corner(5) })
-
-local incBtn = Button("+", 13, {
-    Size = UDim2.new(0, 28, 0, 22),
-    Position = UDim2.new(1, -32, 0.5, -11),
-    BackgroundColor3 = Theme.AccentDim,
-    Parent = maxArgsRow,
-}, { Corner(5) })
-
-decBtn.MouseButton1Click:Connect(function()
-    RSP.Settings.MaxArgs = math.max(1, RSP.Settings.MaxArgs - 1)
-    maxArgsRow:FindFirstChild("MaxArgsLabel").Text = "Máximo de Argumentos: " .. RSP.Settings.MaxArgs
-end)
-incBtn.MouseButton1Click:Connect(function()
-    RSP.Settings.MaxArgs = math.min(50, RSP.Settings.MaxArgs + 1)
-    maxArgsRow:FindFirstChild("MaxArgsLabel").Text = "Máximo de Argumentos: " .. RSP.Settings.MaxArgs
-end)
-
-SectionLabel("── Ações ──", 14)
-
--- Exportar logs
-local ExportRow = Create("Frame", {
-    Size = UDim2.new(1, 0, 0, 40),
-    BackgroundTransparency = 1,
-    LayoutOrder = 15,
-    Parent = SettingsContent,
-}, {
-    Create("UIListLayout", {
-        FillDirection = Enum.FillDirection.Horizontal,
-        Padding = UDim.new(0, 8),
-        VerticalAlignment = Enum.VerticalAlignment.Center,
-    }),
-})
-
-local ExportBtn = Button("📤 Exportar Logs (JSON)", 12, {
-    Size = UDim2.new(0, 190, 0, 32),
-    BackgroundColor3 = Theme.AccentDim,
-    Parent = ExportRow,
-}, { Corner(7) })
-
-ExportBtn.MouseButton1Click:Connect(function()
-    if not setclipboard then
-        return
-    end
-    
-    local export = {}
-    for _, log in ipairs(RSP.Logs) do
-        table.insert(export, {
-            id = log.id,
-            timestamp = log.timestamp,
-            type = log.type,
-            remoteType = log.remoteType,
-            remoteName = log.remoteName,
-            remotePath = log.remotePath,
-            argsFormatted = log.argsFormatted,
-            blocked = log.blocked,
-            callerScript = log.callerScript,
-            callerLine = log.callerLine,
-            direction = log.direction,
-        })
-    end
-    
-    local ok, json = pcall(HttpService.JSONEncode, HttpService, export)
-    if ok then
-        setclipboard(json)
-        ExportBtn.Text = "✅ Copiado!"
-        task.delay(2, function()
-            ExportBtn.Text = "📤 Exportar Logs (JSON)"
-        end)
-    end
-end)
-
-local ClearAllBtn = Button("🗑 Limpar Tudo", 12, {
-    Size = UDim2.new(0, 120, 0, 32),
-    BackgroundColor3 = Color3.fromRGB(60, 20, 20),
-    TextColor3 = Theme.Error,
-    Parent = ExportRow,
-}, { Corner(7) })
-
-ClearAllBtn.MouseButton1Click:Connect(function()
-    RSP.Logs = {}
-    RSP.Stats = {}
-    RSP.Blocked = {}
-    for _, child in ipairs(LogList:GetChildren()) do
-        if child:IsA("TextButton") then child:Destroy() end
-    end
-    logEntries = {}
-    clearDetail()
-    LogCountLabel.Text = "0 logs"
-end)
-
--- ============================================================
--- DRAG
--- ============================================================
-
-local dragging = false
-local dragStart, startPos
-
-Header.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 then
-        dragging = true
-        dragStart = input.Position
-        startPos = MainFrame.Position
-    end
-end)
-
-UserInputService.InputChanged:Connect(function(input)
-    if dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
-        local delta = input.Position - dragStart
-        MainFrame.Position = UDim2.new(
-            startPos.X.Scale,
-            startPos.X.Offset + delta.X,
-            startPos.Y.Scale,
-            startPos.Y.Offset + delta.Y
-        )
-    end
-end)
-
-UserInputService.InputEnded:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 then
-        dragging = false
-    end
-end)
-
--- ============================================================
--- INICIALIZAÇÃO
--- ============================================================
-
-switchTab("Logs")
-setupHooks()
-
--- Animação de entrada
-MainFrame.Size = UDim2.new(0, 0, 0, 0)
-MainFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
-TweenService:Create(MainFrame, TweenInfo.new(0.35, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
-    Size = UDim2.new(0, 720, 0, 500),
-    Position = UDim2.new(0.5, -360, 0.5, -250),
-}):Play()
-
--- Log de inicialização
-task.delay(0.5, function()
-    addLog({
-        type = "FireServer",
-        remoteType = "Sistema",
-        remoteName = "RemoteSpyPro",
-        remotePath = "System.RemoteSpyPro",
-        args = { "Iniciado com sucesso!", RSP.Version },
-        argsFormatted = '("Iniciado com sucesso!", "' .. RSP.Version .. '")',
-        blocked = false,
-        direction = "⚡ Sistema",
-        callerScript = nil,
-        callerLine = nil,
-    })
-    
-    print("[RemoteSpy Pro] ✅ Iniciado! Espiando remotes...")
-    print("[RemoteSpy Pro] Use RSP.Enabled = false para pausar")
-    print("[RemoteSpy Pro] Use RSP.Blocked['caminho'] = true para bloquear")
-    print("[RemoteSpy Pro] Use RSP.Logs para acessar os logs programaticamente")
-end)
-
--- Expor globalmente
 getgenv().RSP = RSP
 
+-- ╔══════════════════════════════════════╗
+-- ║           UTILITÁRIOS                ║
+-- ╚══════════════════════════════════════╝
+
+local function safePath(inst)
+    if not inst or typeof(inst) ~= "Instance" then return "?" end
+    local ok, r = pcall(function()
+        local t, o, d = {}, inst, 0
+        while o and o ~= game and d < 20 do
+            table.insert(t, 1, o.Name)
+            o = o.Parent; d = d + 1
+        end
+        return table.concat(t, ".")
+    end)
+    return (ok and r) or tostring(inst)
+end
+
+local function fmtVal(v, depth)
+    depth = depth or 0
+    local t = typeof(v)
+    if t == "string"   then
+        local s = v:gsub('"','\\"'):gsub('\n','\\n')
+        return string.format('"%s"', #s>60 and s:sub(1,57).."..." or s)
+    elseif t == "number"  then
+        return v == math.floor(v) and tostring(math.floor(v)) or string.format("%.3f",v)
+    elseif t == "boolean" or t == "nil" then return tostring(v)
+    elseif t == "Vector3"  then return string.format("V3(%g,%g,%g)",v.X,v.Y,v.Z)
+    elseif t == "Vector2"  then return string.format("V2(%g,%g)",v.X,v.Y)
+    elseif t == "CFrame"   then local p=v.Position return string.format("CF(%g,%g,%g)",p.X,p.Y,p.Z)
+    elseif t == "Color3"   then return string.format("RGB(%d,%d,%d)",v.R*255,v.G*255,v.B*255)
+    elseif t == "UDim2"    then return string.format("UDim2(%g,%g,%g,%g)",v.X.Scale,v.X.Offset,v.Y.Scale,v.Y.Offset)
+    elseif t == "Instance" then
+        local ok2, p2 = pcall(safePath, v)
+        return string.format("<%s:%s>", v.ClassName, ok2 and p2 or "?")
+    elseif t == "table" then
+        if depth > 2 then return "{...}" end
+        local parts, n = {}, 0
+        for k, val in pairs(v) do
+            n = n + 1; if n > 5 then parts[n]="..."; break end
+            parts[n] = tostring(k).."="..fmtVal(val, depth+1)
+        end
+        return n == 0 and "{}" or "{"..table.concat(parts,",").."}"
+    else
+        if t:find("Enum") then return tostring(v) end
+        return string.format("<%s>",t)
+    end
+end
+
+local function fmtArgs(args)
+    if not args or #args == 0 then return "()" end
+    local parts = {}
+    for i = 1, math.min(#args, RSP.Settings.MaxArgs) do
+        parts[i] = fmtVal(args[i])
+    end
+    if #args > RSP.Settings.MaxArgs then
+        parts[#parts+1] = string.format("+%d", #args - RSP.Settings.MaxArgs)
+    end
+    return "("..table.concat(parts,", ")..")"
+end
+
+local function toLuaVal(v, d)
+    d = d or 0
+    local t = typeof(v)
+    if t=="string"  then return string.format("%q",v) end
+    if t=="number" or t=="boolean" or t=="nil" then return tostring(v) end
+    if t=="Vector3" then return string.format("Vector3.new(%g,%g,%g)",v.X,v.Y,v.Z) end
+    if t=="Vector2" then return string.format("Vector2.new(%g,%g)",v.X,v.Y) end
+    if t=="CFrame"  then local p=v.Position return string.format("CFrame.new(%g,%g,%g)",p.X,p.Y,p.Z) end
+    if t=="Color3"  then return string.format("Color3.fromRGB(%d,%d,%d)",v.R*255,v.G*255,v.B*255) end
+    if t=="Instance" then return string.format('game:GetService("ReplicatedStorage") --[[%s]]',safePath(v)) end
+    if t=="table" and d < 2 then
+        local parts = {}
+        for k,val in pairs(v) do parts[#parts+1]=string.format("[%q]=%s",tostring(k),toLuaVal(val,d+1)) end
+        return "{"..table.concat(parts,",").."}"
+    end
+    return "nil"
+end
+
+local function buildScript(log)
+    local args = {}
+    for _, v in ipairs(log.args or {}) do args[#args+1] = toLuaVal(v) end
+    local argStr = table.concat(args, ", ")
+    local rPath  = string.format('game:GetService("ReplicatedStorage"):FindFirstChild("%s",true)', log.remoteName or "?")
+    if log.type == "FireServer" then
+        return string.format('-- [RSP] %s\nlocal r=%s\nif r then r:FireServer(%s) end', log.timestamp, rPath, argStr)
+    elseif log.type == "InvokeServer" then
+        return string.format('-- [RSP] %s\nlocal r=%s\nif r then local res=r:InvokeServer(%s) end', log.timestamp, rPath, argStr)
+    end
+    return string.format('-- [RSP] %s [%s]\n-- Path: %s\n-- Args: %s', log.timestamp, log.type, log.remotePath, log.argsFormatted)
+end
+
+-- ╔══════════════════════════════════════╗
+-- ║          SISTEMA DE LOG              ║
+-- ╚══════════════════════════════════════╝
+
+local function addLog(data)
+    if not RSP.Enabled then return end
+    local path = data.remotePath or "?"
+    if not RSP.Stats[path] then RSP.Stats[path] = {calls=0,blocked=0} end
+    RSP.Stats[path].calls = RSP.Stats[path].calls + 1
+    if data.blocked then RSP.Stats[path].blocked = RSP.Stats[path].blocked + 1 end
+    data.id          = #RSP.Logs + 1
+    data.timestamp   = os.date("%H:%M:%S")
+    data.argsFormatted = fmtArgs(data.args)
+    table.insert(RSP.Logs, data)
+    if #RSP.Logs > RSP.MaxLogs then table.remove(RSP.Logs, 1) end
+    for _, cb in ipairs(RSP._logCBs) do pcall(cb, data) end
+end
+
+local function onLog(cb) table.insert(RSP._logCBs, cb) end
+
+-- ╔══════════════════════════════════════╗
+-- ║        HOOK ENGINE                   ║
+-- ╚══════════════════════════════════════╝
+
+local function getCallerSafe()
+    local src, line = nil, nil
+    pcall(function()
+        for i = 4, 8 do
+            local info = debug.info(i, "sln")
+            if info then
+                local s = info[1] or ""
+                if s ~= "" and not s:lower():find("remotespypro") and not s:lower():find("executor") then
+                    src = s; line = info[2]; break
+                end
+            end
+        end
+    end)
+    return src, line
+end
+
+-- Hookar OnClientEvent em todas as RemoteEvents encontradas
+local function hookClientEvents()
+    local function hookRE(obj)
+        if typeof(obj) ~= "Instance" then return end
+        local ok, isRE = pcall(function() return obj:IsA("RemoteEvent") end)
+        if not ok or not isRE then return end
+        local key = tostring(obj) .. "_client"
+        if RSP._patched[key] then return end
+        RSP._patched[key] = true
+        pcall(function()
+            obj.OnClientEvent:Connect(function(...)
+                if not RSP.Enabled or not RSP.Settings.OnClientEvent then return end
+                addLog({ type="OnClientEvent", remoteType="RemoteEvent",
+                    remoteName=obj.Name, remotePath=safePath(obj),
+                    remote=obj, args={...}, blocked=false, direction="← Client" })
+            end)
+        end)
+    end
+    task.spawn(function()
+        pcall(function()
+            for _, obj in ipairs(game:GetDescendants()) do hookRE(obj) end
+        end)
+        game.DescendantAdded:Connect(function(obj) task.defer(hookRE, obj) end)
+    end)
+end
+
+-- ── MÉTODO 1: hookfunction no protótipo (Xeno, KRNL, Fluxus, Solara) ──
+local function setupHookFunction()
+    print("[RSP] Usando hookfunction no protótipo...")
+
+    local tRE = Instance.new("RemoteEvent")
+    local tRF = Instance.new("RemoteFunction")
+    local tBE = Instance.new("BindableEvent")
+    local tBF = Instance.new("BindableFunction")
+
+    local orig_FS = tRE.FireServer
+    local orig_IS = tRF.InvokeServer
+    local orig_FBE= tBE.Fire
+    local orig_IBF= tBF.Invoke
+
+    tRE:Destroy(); tRF:Destroy(); tBE:Destroy(); tBF:Destroy()
+
+    RSP._originals.FireServer   = orig_FS
+    RSP._originals.InvokeServer = orig_IS
+
+    local results = {}
+
+    results[1] = pcall(function()
+        ENV.hookfunction(orig_FS, ENV.newcclosure(function(self, ...)
+            if ENV.checkcaller() then return orig_FS(self, ...) end
+            if not RSP.Settings.FireServer then return orig_FS(self, ...) end
+            local args = {...}
+            local path = safePath(self)
+            local blocked = RSP.Blocked[path]
+            local src, ln = getCallerSafe()
+            addLog({ type="FireServer", remoteType="RemoteEvent",
+                remoteName=self.Name, remotePath=path,
+                remote=self, args=args, blocked=blocked,
+                callerScript=src, callerLine=ln, direction="→ Server" })
+            if blocked then return end
+            return orig_FS(self, ...)
+        end))
+    end)
+
+    results[2] = pcall(function()
+        ENV.hookfunction(orig_IS, ENV.newcclosure(function(self, ...)
+            if ENV.checkcaller() then return orig_IS(self, ...) end
+            if not RSP.Settings.InvokeServer then return orig_IS(self, ...) end
+            local args = {...}
+            local path = safePath(self)
+            local blocked = RSP.Blocked[path]
+            local src, ln = getCallerSafe()
+            addLog({ type="InvokeServer", remoteType="RemoteFunction",
+                remoteName=self.Name, remotePath=path,
+                remote=self, args=args, blocked=blocked,
+                callerScript=src, callerLine=ln, direction="→ Server" })
+            if blocked then return nil end
+            return orig_IS(self, ...)
+        end))
+    end)
+
+    results[3] = pcall(function()
+        ENV.hookfunction(orig_FBE, ENV.newcclosure(function(self, ...)
+            if ENV.checkcaller() then return orig_FBE(self, ...) end
+            if not RSP.Settings.Bindables then return orig_FBE(self, ...) end
+            local args = {...}
+            local path = safePath(self)
+            addLog({ type="Fire", remoteType="BindableEvent",
+                remoteName=self.Name, remotePath=path,
+                remote=self, args=args, blocked=RSP.Blocked[path], direction="→ Bind" })
+            if RSP.Blocked[path] then return end
+            return orig_FBE(self, ...)
+        end))
+    end)
+
+    results[4] = pcall(function()
+        ENV.hookfunction(orig_IBF, ENV.newcclosure(function(self, ...)
+            if ENV.checkcaller() then return orig_IBF(self, ...) end
+            if not RSP.Settings.Bindables then return orig_IBF(self, ...) end
+            local args = {...}
+            local path = safePath(self)
+            addLog({ type="Invoke", remoteType="BindableFunction",
+                remoteName=self.Name, remotePath=path,
+                remote=self, args=args, blocked=RSP.Blocked[path], direction="→ Bind" })
+            if RSP.Blocked[path] then return nil end
+            return orig_IBF(self, ...)
+        end))
+    end)
+
+    for i, ok in ipairs(results) do
+        print(string.format("[RSP] hookfunction[%d]: %s", i, tostring(ok)))
+    end
+
+    hookClientEvents()
+    return results[1] or results[2]
+end
+
+-- ── MÉTODO 2: hookmetamethod __namecall (Synapse X, Wave) ──
+local function setupNamecallHook()
+    print("[RSP] Usando hookmetamethod __namecall...")
+    local gameMeta = ENV.getrawmetatable(game)
+    local oldNC    = gameMeta.__namecall
+    RSP._originals.__namecall = oldNC
+    local ok = pcall(ENV.hookmetamethod, game, "__namecall", ENV.newcclosure(function(self, ...)
+        local method = ENV.getnamecallmethod()
+        if ENV.checkcaller() or not RSP.Enabled then return oldNC(self, ...) end
+        local t = typeof(self)=="Instance" and self.ClassName or ""
+        if t=="RemoteEvent" and method=="FireServer" and RSP.Settings.FireServer then
+            local args, path = {...}, safePath(self)
+            local blocked = RSP.Blocked[path]
+            local src, ln = getCallerSafe()
+            addLog({ type="FireServer", remoteType="RemoteEvent",
+                remoteName=self.Name, remotePath=path, remote=self,
+                args=args, blocked=blocked, callerScript=src, callerLine=ln, direction="→ Server" })
+            if blocked then return end
+            return oldNC(self, ...)
+        end
+        if t=="RemoteFunction" and method=="InvokeServer" and RSP.Settings.InvokeServer then
+            local args, path = {...}, safePath(self)
+            local blocked = RSP.Blocked[path]
+            local src, ln = getCallerSafe()
+            addLog({ type="InvokeServer", remoteType="RemoteFunction",
+                remoteName=self.Name, remotePath=path, remote=self,
+                args=args, blocked=blocked, callerScript=src, callerLine=ln, direction="→ Server" })
+            if blocked then return nil end
+            return oldNC(self, ...)
+        end
+        if t=="BindableEvent" and method=="Fire" and RSP.Settings.Bindables then
+            local args, path = {...}, safePath(self)
+            addLog({ type="Fire", remoteType="BindableEvent",
+                remoteName=self.Name, remotePath=path, remote=self,
+                args=args, blocked=RSP.Blocked[path], direction="→ Bind" })
+            if RSP.Blocked[path] then return end
+            return oldNC(self, ...)
+        end
+        if t=="BindableFunction" and method=="Invoke" and RSP.Settings.Bindables then
+            local args, path = {...}, safePath(self)
+            addLog({ type="Invoke", remoteType="BindableFunction",
+                remoteName=self.Name, remotePath=path, remote=self,
+                args=args, blocked=RSP.Blocked[path], direction="→ Bind" })
+            if RSP.Blocked[path] then return nil end
+            return oldNC(self, ...)
+        end
+        return oldNC(self, ...)
+    end))
+    hookClientEvents()
+    return ok
+end
+
+-- ── MÉTODO 3: Fallback - patch por instância ──
+local function patchInstance(obj)
+    if not obj or not obj.Parent then return end
+    local key = tostring(obj)
+    if RSP._patched[key] then return end
+    RSP._patched[key] = true
+    local cls = obj.ClassName
+
+    if cls == "RemoteEvent" then
+        local origFire = obj.FireServer
+        pcall(function()
+            obj.FireServer = function(s, ...)
+                local args, path = {...}, safePath(s)
+                if RSP.Enabled and RSP.Settings.FireServer then
+                    addLog({ type="FireServer", remoteType="RemoteEvent",
+                        remoteName=s.Name, remotePath=path, remote=s,
+                        args=args, blocked=RSP.Blocked[path], direction="→ Server" })
+                    if RSP.Blocked[path] then return end
+                end
+                return origFire(s, ...)
+            end
+        end)
+        pcall(function()
+            obj.OnClientEvent:Connect(function(...)
+                if not RSP.Enabled or not RSP.Settings.OnClientEvent then return end
+                addLog({ type="OnClientEvent", remoteType="RemoteEvent",
+                    remoteName=obj.Name, remotePath=safePath(obj),
+                    remote=obj, args={...}, blocked=false, direction="← Client" })
+            end)
+        end)
+
+    elseif cls == "RemoteFunction" then
+        local origInv = obj.InvokeServer
+        pcall(function()
+            obj.InvokeServer = function(s, ...)
+                local args, path = {...}, safePath(s)
+                if RSP.Enabled and RSP.Settings.InvokeServer then
+                    addLog({ type="InvokeServer", remoteType="RemoteFunction",
+                        remoteName=s.Name, remotePath=path, remote=s,
+                        args=args, blocked=RSP.Blocked[path], direction="→ Server" })
+                    if RSP.Blocked[path] then return nil end
+                end
+                return origInv(s, ...)
+            end
+        end)
+
+    elseif cls == "BindableEvent" and RSP.Settings.Bindables then
+        local origFire = obj.Fire
+        pcall(function()
+            obj.Fire = function(s, ...)
+                local args, path = {...}, safePath(s)
+                if RSP.Enabled then
+                    addLog({ type="Fire", remoteType="BindableEvent",
+                        remoteName=s.Name, remotePath=path, remote=s,
+                        args=args, blocked=RSP.Blocked[path], direction="→ Bind" })
+                    if RSP.Blocked[path] then return end
+                end
+                return origFire(s, ...)
+            end
+        end)
+
+    elseif cls == "BindableFunction" and RSP.Settings.Bindables then
+        local origInv = obj.Invoke
+        pcall(function()
+            obj.Invoke = function(s, ...)
+                local args, path = {...}, safePath(s)
+                if RSP.Enabled then
+                    addLog({ type="Invoke", remoteType="BindableFunction",
+                        remoteName=s.Name, remotePath=path, remote=s,
+                        args=args, blocked=RSP.Blocked[path], direction="→ Bind" })
+                    if RSP.Blocked[path] then return nil end
+                end
+                return origInv(s, ...)
+            end
+        end)
+    end
+end
+
+local function setupFallback()
+    print("[RSP] Usando fallback: patch por instância...")
+    local function scan(p)
+        pcall(function()
+            for _, obj in ipairs(p:GetDescendants()) do
+                local c = obj.ClassName
+                if c=="RemoteEvent" or c=="RemoteFunction"
+                or c=="BindableEvent" or c=="BindableFunction" then
+                    task.defer(patchInstance, obj)
+                end
+            end
+        end)
+    end
+    scan(game)
+    game.DescendantAdded:Connect(function(obj) task.defer(patchInstance, obj) end)
+end
+
+-- Escolher melhor método
+local hookMode = "fallback"
+local function initHooks()
+    local ok = false
+    if ENV.CanHookFunction then
+        local s = pcall(setupHookFunction)
+        if s then ok=true; hookMode="hookfunction" end
+    end
+    if not ok and ENV.CanHookMeta then
+        local s = pcall(setupNamecallHook)
+        if s then ok=true; hookMode="__namecall" end
+    end
+    if not ok then
+        pcall(setupFallback)
+        hookMode = "fallback"
+    end
+    print(string.format("[RSP] ✅ Hook ativo: %s", hookMode))
+end
+
+-- ╔══════════════════════════════════════╗
+-- ║          INTERFACE GRÁFICA           ║
+-- ╚══════════════════════════════════════╝
+
+-- Limpar UI antiga
+pcall(function() CoreGui:FindFirstChild("RSP_Pro"):Destroy() end)
+pcall(function() LocalPlayer.PlayerGui:FindFirstChild("RSP_Pro"):Destroy() end)
+
+local C = {
+    BG      = Color3.fromRGB(13,13,18),
+    Surface = Color3.fromRGB(20,20,28),
+    Panel   = Color3.fromRGB(26,26,36),
+    Border  = Color3.fromRGB(42,42,58),
+    Accent  = Color3.fromRGB(90,170,255),
+    AccentD = Color3.fromRGB(55,110,200),
+    Success = Color3.fromRGB(72,210,110),
+    Warning = Color3.fromRGB(255,185,55),
+    Error   = Color3.fromRGB(255,72,72),
+    Text    = Color3.fromRGB(215,215,230),
+    TextD   = Color3.fromRGB(130,130,155),
+    TextM   = Color3.fromRGB(68,68,90),
+    FireServer    = Color3.fromRGB(90,170,255),
+    InvokeServer  = Color3.fromRGB(175,115,255),
+    OnClientEvent = Color3.fromRGB(72,210,130),
+    OnClientInvoke= Color3.fromRGB(130,255,160),
+    Fire          = Color3.fromRGB(255,160,55),
+    Invoke        = Color3.fromRGB(255,115,75),
+}
+local function typeClr(t) return C[t] or C.TextD end
+
+-- Helpers de criação
+local function N(cn, p, ch)
+    local i = Instance.new(cn)
+    for k,v in pairs(p or {}) do if k~="Parent" then pcall(function() i[k]=v end) end end
+    for _,c in ipairs(ch or {}) do if c then c.Parent=i end end
+    if p and p.Parent then i.Parent=p.Parent end
+    return i
+end
+local function Lbl(txt,sz,col,fnt,p)
+    local pr=p or {}
+    pr.Text=txt; pr.TextSize=sz or 13; pr.TextColor3=col or C.Text
+    pr.Font=fnt or Enum.Font.Gotham
+    pr.BackgroundTransparency=pr.BackgroundTransparency~=nil and pr.BackgroundTransparency or 1
+    pr.TextXAlignment=pr.TextXAlignment or Enum.TextXAlignment.Left
+    return N("TextLabel",pr)
+end
+local function Btn(txt,sz,p,ch)
+    local pr=p or {}
+    pr.Text=txt; pr.TextSize=sz or 12
+    pr.Font=pr.Font or Enum.Font.GothamBold
+    pr.TextColor3=pr.TextColor3 or C.Text
+    pr.BackgroundColor3=pr.BackgroundColor3 or C.Panel
+    pr.BorderSizePixel=0; pr.AutoButtonColor=false
+    local b=N("TextButton",pr,ch)
+    local origBG=b.BackgroundColor3
+    b.MouseEnter:Connect(function()
+        b.BackgroundColor3=Color3.new(math.min(1,origBG.R+.07),math.min(1,origBG.G+.07),math.min(1,origBG.B+.07))
+    end)
+    b.MouseLeave:Connect(function() b.BackgroundColor3=origBG end)
+    return b
+end
+local function Rnd(r) return N("UICorner",{CornerRadius=UDim.new(0,r or 6)}) end
+local function Pad(v,h) return N("UIPadding",{
+    PaddingTop=UDim.new(0,v or 6),PaddingBottom=UDim.new(0,v or 6),
+    PaddingLeft=UDim.new(0,h or 8),PaddingRight=UDim.new(0,h or 8)}) end
+local function Div(p) local pr=p or {}
+    pr.BackgroundColor3=pr.BackgroundColor3 or C.Border
+    pr.BorderSizePixel=0; pr.Size=pr.Size or UDim2.new(1,0,0,1)
+    return N("Frame",pr) end
+
+-- ── ScreenGui + Janela ──
+local SG = N("ScreenGui",{Name="RSP_Pro",ResetOnSpawn=false,
+    ZIndexBehavior=Enum.ZIndexBehavior.Sibling,DisplayOrder=9999})
+pcall(function() SG.Parent=CoreGui end)
+if not SG.Parent then SG.Parent=LocalPlayer.PlayerGui end
+RSP.UI.ScreenGui=SG
+
+local WIN_W,WIN_H=740,490
+local Win = N("Frame",{Name="Window",
+    Size=UDim2.new(0,WIN_W,0,WIN_H),
+    Position=UDim2.new(0.5,-WIN_W/2,0.5,-WIN_H/2),
+    BackgroundColor3=C.BG,BorderSizePixel=0,ClipsDescendants=true,
+    Parent=SG},{Rnd(10),N("UIStroke",{Color=C.Border,Thickness=1.5})})
+RSP.UI.Win=Win
+
+-- ── Header ──
+local HDR = N("Frame",{Size=UDim2.new(1,0,0,38),BackgroundColor3=C.Surface,
+    BorderSizePixel=0,Parent=Win},{Rnd(10)})
+N("Frame",{Size=UDim2.new(1,0,0,12),Position=UDim2.new(0,0,1,-12),
+    BackgroundColor3=C.Surface,BorderSizePixel=0,Parent=HDR})
+
+N("Frame",{Size=UDim2.new(0,7,0,7),Position=UDim2.new(0,12,0.5,-3.5),
+    BackgroundColor3=C.Accent,BorderSizePixel=0,Parent=HDR},{Rnd(4)})
+N("Frame",{Size=UDim2.new(0,7,0,7),Position=UDim2.new(0,23,0.5,-3.5),
+    BackgroundColor3=C.AccentD,BorderSizePixel=0,Parent=HDR},{Rnd(4)})
+Lbl("Remote Spy Pro",13,C.Text,Enum.Font.GothamBold,{
+    Position=UDim2.new(0,38,0,0),Size=UDim2.new(0,200,1,0),Parent=HDR})
+Lbl("v"..RSP.Version,10,C.TextM,Enum.Font.Gotham,{
+    Position=UDim2.new(0,168,0,0),Size=UDim2.new(0,50,1,0),Parent=HDR})
+Lbl(ENV.Name,9,C.TextD,Enum.Font.Gotham,{
+    Position=UDim2.new(0,218,0,0),Size=UDim2.new(0,130,1,0),Parent=HDR})
+
+local HBtns=N("Frame",{Size=UDim2.new(0,108,1,0),Position=UDim2.new(1,-108,0,0),
+    BackgroundTransparency=1,Parent=HDR})
+local BtnMin    = Btn("—",10,{Size=UDim2.new(0,28,0,18),Position=UDim2.new(0,4,0.5,-9),
+    BackgroundColor3=C.Panel,Parent=HBtns},{Rnd(5)})
+local BtnToggle = Btn("●",10,{Size=UDim2.new(0,28,0,18),Position=UDim2.new(0,36,0.5,-9),
+    BackgroundColor3=C.Panel,TextColor3=C.Success,Parent=HBtns},{Rnd(5)})
+local BtnClose  = Btn("✕",10,{Size=UDim2.new(0,28,0,18),Position=UDim2.new(0,68,0.5,-9),
+    BackgroundColor3=C.Panel,TextColor3=C.Error,Parent=HBtns},{Rnd(5)})
+
+local minimized=false
+BtnMin.MouseButton1Click:Connect(function()
+    minimized=not minimized
+    TweenService:Create(Win,TweenInfo.new(0.22,Enum.EasingStyle.Quart),{
+        Size=minimized and UDim2.new(0,WIN_W,0,38) or UDim2.new(0,WIN_W,0,WIN_H)
+    }):Play()
+end)
+BtnToggle.MouseButton1Click:Connect(function()
+    RSP.Enabled=not RSP.Enabled
+    BtnToggle.TextColor3=RSP.Enabled and C.Success or C.Error
+    BtnToggle.Text=RSP.Enabled and "●" or "○"
+end)
+BtnClose.MouseButton1Click:Connect(function()
+    TweenService:Create(Win,TweenInfo.new(0.18),{Size=UDim2.new(0,0,0,0)}):Play()
+    task.delay(0.2,function() SG:Destroy() end)
+end)
+
+-- ── Tab Bar ──
+local TABS_H=32
+local TabBar=N("Frame",{Size=UDim2.new(1,0,0,TABS_H),Position=UDim2.new(0,0,0,38),
+    BackgroundColor3=C.Surface,BorderSizePixel=0,Parent=Win},{
+    N("UIListLayout",{FillDirection=Enum.FillDirection.Horizontal,
+        VerticalAlignment=Enum.VerticalAlignment.Center,Padding=UDim.new(0,2)}),
+    Pad(0,6)})
+
+local CONTENT_Y=38+TABS_H+1
+local Content=N("Frame",{Size=UDim2.new(1,0,1,-CONTENT_Y),
+    Position=UDim2.new(0,0,0,CONTENT_Y),BackgroundTransparency=1,
+    ClipsDescendants=true,Parent=Win})
+Div({Position=UDim2.new(0,0,0,38+TABS_H),Parent=Win})
+
+local tabFrames={} local tabBtns={}
+local function mkTab(name,icon,order)
+    local btn=Btn(icon.." "..name,11,{Size=UDim2.new(0,88,1,-4),
+        BackgroundTransparency=1,TextColor3=C.TextD,LayoutOrder=order,Parent=TabBar})
+    local frame=N("Frame",{Name=name,Size=UDim2.new(1,0,1,0),
+        BackgroundTransparency=1,Visible=false,Parent=Content})
+    tabFrames[name]=frame; tabBtns[name]=btn
+    return btn,frame
+end
+local LBtn,LFrame=mkTab("Logs",  "📋",1)
+local RBtn,RFrame=mkTab("Remotes","📡",2)
+local BBtn,BFrame=mkTab("Block", "🚫",3)
+local SBtn,SFrame=mkTab("Config","⚙", 4)
+
+local function switchTab(name)
+    RSP.CurrentTab=name
+    for n,f in pairs(tabFrames) do f.Visible=n==name end
+    for n,b in pairs(tabBtns) do
+        b.TextColor3=n==name and C.Accent or C.TextD
+        b.BackgroundTransparency=n==name and 0 or 1
+        if n==name then b.BackgroundColor3=C.BG end
+    end
+end
+for name,btn in pairs(tabBtns) do
+    btn.MouseButton1Click:Connect(function() switchTab(name) end)
+end
+
+-- ════════════════════════════════════════
+-- ABA LOGS — VIRTUAL SCROLL (sem freeze)
+-- Apenas ~16 frames reaproveitados; canvas
+-- size calculado manualmente.
+-- ════════════════════════════════════════
+local ITEM_H  =34
+local ITEM_GAP=1
+local ITEM_S  =ITEM_H+ITEM_GAP
+local POOL_N  =16
+
+-- Toolbar
+local LogToolbar=N("Frame",{Size=UDim2.new(1,0,0,36),BackgroundColor3=C.Surface,
+    BorderSizePixel=0,Parent=LFrame},{
+    Pad(4,8),
+    N("UIListLayout",{FillDirection=Enum.FillDirection.Horizontal,
+        VerticalAlignment=Enum.VerticalAlignment.Center,Padding=UDim.new(0,6)})})
+
+local SearchBox=N("TextBox",{PlaceholderText="🔍 Filtrar...",PlaceholderColor3=C.TextM,
+    Text="",TextSize=12,Font=Enum.Font.Gotham,TextColor3=C.Text,
+    Size=UDim2.new(0,195,0,24),BackgroundColor3=C.Panel,BorderSizePixel=0,
+    TextXAlignment=Enum.TextXAlignment.Left,ClearTextOnFocus=false,
+    Parent=LogToolbar},{Rnd(6),Pad(0,8),N("UIStroke",{Color=C.Border,Thickness=1})})
+
+local ClearLogsBtn=Btn("🗑 Limpar",11,{Size=UDim2.new(0,70,0,24),
+    BackgroundColor3=C.Panel,Parent=LogToolbar},{Rnd(6)})
+local LogCountLbl=Lbl("0 logs",10,C.TextM,Enum.Font.Gotham,{
+    Size=UDim2.new(0,70,0,24),TextXAlignment=Enum.TextXAlignment.Right,
+    Parent=LogToolbar})
+
+-- Split: lista | detalhe
+local LogSplit=N("Frame",{Size=UDim2.new(1,0,1,-37),Position=UDim2.new(0,0,0,37),
+    BackgroundTransparency=1,Parent=LFrame})
+Div({Size=UDim2.new(1,0,0,1),Position=UDim2.new(0,0,0,0),Parent=LogSplit})
+
+local LIST_W=415
+local ListPanel=N("Frame",{Size=UDim2.new(0,LIST_W,1,0),BackgroundTransparency=1,Parent=LogSplit})
+
+-- ScrollingFrame SEM AutomaticCanvasSize
+local LogScroll=N("ScrollingFrame",{Size=UDim2.new(1,0,1,0),BackgroundTransparency=1,
+    BorderSizePixel=0,ScrollBarThickness=4,ScrollBarImageColor3=C.Border,
+    CanvasSize=UDim2.new(0,0,0,0),Parent=ListPanel})
+local LogInner=N("Frame",{Size=UDim2.new(1,0,1,0),BackgroundTransparency=1,Parent=LogScroll})
+
+-- Pool de itens (reaproveitados)
+local pool={}
+for i=1,POOL_N do
+    local item=N("Frame",{Size=UDim2.new(1,-6,0,ITEM_H),BackgroundColor3=C.Surface,
+        BorderSizePixel=0,Visible=false,Parent=LogInner},{Rnd(5)})
+    local bar=N("Frame",{Size=UDim2.new(0,3,1,0),BackgroundColor3=C.Accent,
+        BorderSizePixel=0,Parent=item},{Rnd(2)})
+    local tagBg=N("Frame",{Size=UDim2.new(0,90,0,18),Position=UDim2.new(0,9,0.5,-9),
+        BackgroundColor3=C.Panel,BorderSizePixel=0,Parent=item},{Rnd(4)})
+    local tagLbl=Lbl("",10,C.Accent,Enum.Font.GothamBold,{
+        Size=UDim2.new(1,0,1,0),TextXAlignment=Enum.TextXAlignment.Center,Parent=tagBg})
+    local nameLbl=Lbl("",12,C.Text,Enum.Font.GothamBold,{
+        Size=UDim2.new(1,-278,1,0),Position=UDim2.new(0,105,0,0),
+        TextTruncate=Enum.TextTruncate.AtEnd,Parent=item})
+    local argsLbl=Lbl("",9,C.TextD,Enum.Font.Code,{
+        Size=UDim2.new(1,-278,0,11),Position=UDim2.new(0,105,0.5,2),
+        TextTruncate=Enum.TextTruncate.AtEnd,Parent=item})
+    local timeLbl=Lbl("",9,C.TextM,Enum.Font.Gotham,{
+        Size=UDim2.new(0,55,1,0),Position=UDim2.new(1,-58,0,0),
+        TextXAlignment=Enum.TextXAlignment.Right,Parent=item})
+    local clickBtn=N("TextButton",{Size=UDim2.new(1,0,1,0),
+        BackgroundTransparency=1,Text="",Parent=item})
+    pool[i]={frame=item,bar=bar,tagBg=tagBg,tagLbl=tagLbl,
+        nameLbl=nameLbl,argsLbl=argsLbl,timeLbl=timeLbl,
+        clickBtn=clickBtn,boundLog=nil}
+end
+
+-- Estado virtual
+local filteredLogs={}
+local selectedLog=nil
+
+local function rebuildFiltered()
+    filteredLogs={}
+    local f=RSP.Filter
+    for _,log in ipairs(RSP.Logs) do
+        local match=f=="" or
+            (log.remoteName or ""):lower():find(f,1,true) or
+            (log.remotePath or ""):lower():find(f,1,true) or
+            (log.type or ""):lower():find(f,1,true)
+        if match then filteredLogs[#filteredLogs+1]=log end
+    end
+end
+
+local showDetail  -- declarada abaixo
+
+local function renderList()
+    local total=#filteredLogs
+    local canvasH=math.max(0, total*ITEM_S)
+    if LogScroll.CanvasSize.Y.Offset ~= canvasH then
+        LogScroll.CanvasSize=UDim2.new(0,0,0,canvasH)
+    end
+    local canvasY=LogScroll.CanvasPosition.Y
+    local firstIdx=math.max(1,math.floor(canvasY/ITEM_S))
+
+    for slot=1,POOL_N do
+        local logIdx=firstIdx+slot-1
+        local pi=pool[slot]
+        if logIdx>total then
+            pi.frame.Visible=false; pi.boundLog=nil
+        else
+            local log=filteredLogs[logIdx]
+            local clr=typeClr(log.type)
+            pi.boundLog=log
+            pi.frame.Visible=true
+            pi.frame.Position=UDim2.new(0,3,0,(logIdx-1)*ITEM_S)
+            pi.bar.BackgroundColor3=log.blocked and C.Error or clr
+            pi.tagBg.BackgroundColor3=Color3.new(clr.R*.18,clr.G*.18,clr.B*.18)
+            pi.tagLbl.TextColor3=clr
+            pi.tagLbl.Text=log.type or ""
+            pi.nameLbl.Text=log.remoteName or "?"
+            pi.nameLbl.TextColor3=log.blocked and C.Error or C.Text
+            pi.argsLbl.Text=log.argsFormatted or ""
+            pi.timeLbl.Text=log.timestamp or ""
+            pi.frame.BackgroundColor3=(selectedLog==log) and C.Panel or C.Surface
+        end
+    end
+end
+
+LogScroll:GetPropertyChangedSignal("CanvasPosition"):Connect(renderList)
+
+for _,pi in ipairs(pool) do
+    pi.clickBtn.MouseButton1Click:Connect(function()
+        if pi.boundLog then
+            selectedLog=pi.boundLog
+            renderList()
+            showDetail(pi.boundLog)
+        end
+    end)
+    pi.frame.MouseEnter:Connect(function()
+        if pi.boundLog and selectedLog~=pi.boundLog then
+            pi.frame.BackgroundColor3=Color3.new(C.Surface.R+.04,C.Surface.G+.04,C.Surface.B+.04)
+        end
+    end)
+    pi.frame.MouseLeave:Connect(function()
+        if pi.boundLog and selectedLog~=pi.boundLog then
+            pi.frame.BackgroundColor3=C.Surface
+        end
+    end)
+end
+
+-- ── Painel de Detalhes ──
+Div({Size=UDim2.new(0,1,1,0),Position=UDim2.new(0,LIST_W,0,0),Parent=LogSplit})
+local DetailPanel=N("Frame",{Size=UDim2.new(1,-LIST_W-1,1,0),
+    Position=UDim2.new(0,LIST_W+1,0,0),BackgroundTransparency=1,
+    ClipsDescendants=true,Parent=LogSplit})
+local DScroll=N("ScrollingFrame",{Size=UDim2.new(1,0,1,0),BackgroundTransparency=1,
+    BorderSizePixel=0,ScrollBarThickness=3,ScrollBarImageColor3=C.Border,
+    CanvasSize=UDim2.new(0,0,0,560),Parent=DetailPanel})
+
+-- Campos fixos (só texto muda, sem recriar frames)
+local D={}
+do
+    local function mkF(yPos,lbl)
+        local row=N("Frame",{Size=UDim2.new(1,0,0,40),Position=UDim2.new(0,0,0,yPos),
+            BackgroundTransparency=1,Parent=DScroll})
+        Lbl(lbl,9,C.TextM,Enum.Font.GothamBold,{Size=UDim2.new(1,0,0,13),
+            Position=UDim2.new(0,10,0,0),Parent=row})
+        return Lbl("",11,C.Text,Enum.Font.Code,{Size=UDim2.new(1,-16,0,26),
+            Position=UDim2.new(0,10,0,13),TextWrapped=true,
+            TextTruncate=Enum.TextTruncate.AtEnd,Parent=row})
+    end
+    local typeRow=N("Frame",{Size=UDim2.new(1,0,0,30),Position=UDim2.new(0,0,0,6),
+        BackgroundColor3=C.Panel,BorderSizePixel=0,Parent=DScroll},{Rnd(6),Pad(0,10)})
+    D.typeTag=Lbl("",13,C.Accent,Enum.Font.GothamBold,{Size=UDim2.new(0.55,0,1,0),Parent=typeRow})
+    D.dirTag =Lbl("",10,C.TextD,Enum.Font.Gotham,{Size=UDim2.new(0.45,0,1,0),
+        Position=UDim2.new(0.55,0,0,0),TextXAlignment=Enum.TextXAlignment.Right,Parent=typeRow})
+    D.time   =mkF(40,  "⏰ Timestamp")
+    D.name   =mkF(82,  "📡 Remote")
+    D.path   =mkF(124, "📁 Path")
+    D.rtype  =mkF(166, "🔷 Tipo")
+    D.script =mkF(208, "📜 Script Origem")
+    D.line   =mkF(250, "📍 Linha")
+    D.status =mkF(292, "🚫 Status")
+    D.args   =mkF(334, "📦 Args preview")
+    D.argsExp=N("TextLabel",{Text="",TextSize=10,Font=Enum.Font.Code,
+        TextColor3=C.TextD,BackgroundColor3=C.Panel,
+        Size=UDim2.new(1,-16,0,76),Position=UDim2.new(0,8,0,376),
+        TextWrapped=true,TextXAlignment=Enum.TextXAlignment.Left,
+        TextYAlignment=Enum.TextYAlignment.Top,Parent=DScroll},{Rnd(5),Pad(4,6)})
+    D.copyBtn=Btn("📋 Copiar Script",11,{Size=UDim2.new(0,128,0,26),
+        Position=UDim2.new(0,8,0,460),BackgroundColor3=C.AccentD,Parent=DScroll},{Rnd(6)})
+    D.blkBtn =Btn("🚫 Bloquear",11,{Size=UDim2.new(0,100,0,26),
+        Position=UDim2.new(0,142,0,460),
+        BackgroundColor3=Color3.fromRGB(55,22,22),TextColor3=C.Error,
+        Parent=DScroll},{Rnd(6)})
+    D.cpPath =Btn("📝 Copiar Path",11,{Size=UDim2.new(0,100,0,26),
+        Position=UDim2.new(0,248,0,460),BackgroundColor3=C.Panel,Parent=DScroll},{Rnd(6)})
+end
+
+-- Conexões dos botões de detalhe (reconectadas a cada seleção)
+local _blkConn, _cpConn
+showDetail = function(log)
+    if not log then return end
+    local clr=typeClr(log.type)
+    D.typeTag.Text=log.type or "?"; D.typeTag.TextColor3=clr
+    D.dirTag.Text=log.direction or ""
+    D.time.Text=log.timestamp or ""
+    D.name.Text=log.remoteName or ""; D.name.TextColor3=clr
+    D.path.Text=log.remotePath or ""
+    D.rtype.Text=log.remoteType or ""
+    D.script.Text=log.callerScript or "(não disponível)"
+    D.script.TextColor3=log.callerScript and C.Warning or C.TextM
+    D.line.Text=log.callerLine and tostring(log.callerLine) or "-"
+    D.status.Text=log.blocked and "BLOQUEADO" or "permitido"
+    D.status.TextColor3=log.blocked and C.Error or C.Success
+    D.args.Text=log.argsFormatted or "()"
+    -- Args expandidos
+    local lines={}
+    for i,v in ipairs(log.args or {}) do
+        if i>RSP.Settings.MaxArgs then break end
+        lines[#lines+1]=string.format("[%d] (%s) %s",i,typeof(v),fmtVal(v))
+    end
+    D.argsExp.Text=#lines>0 and table.concat(lines,"\n") or "(sem argumentos)"
+    DScroll.CanvasPosition=Vector2.new(0,0)
+
+    -- Botão copiar script
+    if _blkConn then _blkConn:Disconnect() end
+    if _cpConn  then _cpConn:Disconnect()  end
+    D.copyBtn.MouseButton1Click:Connect(function()
+        if not ENV.CanCopy then D.copyBtn.Text="❌ Sem clipboard"
+            task.delay(2,function() D.copyBtn.Text="📋 Copiar Script" end); return end
+        ENV.setclipboard(buildScript(log))
+        D.copyBtn.Text="✅ Copiado!"
+        task.delay(1.5,function() D.copyBtn.Text="📋 Copiar Script" end)
+    end)
+    local function refBlk()
+        if RSP.Blocked[log.remotePath] then
+            D.blkBtn.Text="✅ Desbloquear"
+            D.blkBtn.BackgroundColor3=Color3.fromRGB(20,50,25)
+            D.blkBtn.TextColor3=C.Success
+        else
+            D.blkBtn.Text="🚫 Bloquear"
+            D.blkBtn.BackgroundColor3=Color3.fromRGB(55,22,22)
+            D.blkBtn.TextColor3=C.Error
+        end
+    end
+    refBlk()
+    _blkConn=D.blkBtn.MouseButton1Click:Connect(function()
+        RSP.Blocked[log.remotePath]=RSP.Blocked[log.remotePath] and nil or true
+        refBlk()
+    end)
+    _cpConn=D.cpPath.MouseButton1Click:Connect(function()
+        if ENV.CanCopy then
+            ENV.setclipboard(log.remotePath or "")
+            D.cpPath.Text="✅ Copiado!"
+            task.delay(1.5,function() D.cpPath.Text="📝 Copiar Path" end)
+        end
+    end)
+end
+
+-- Limpar logs
+ClearLogsBtn.MouseButton1Click:Connect(function()
+    RSP.Logs={}; RSP.Stats={}; filteredLogs={}; selectedLog=nil
+    LogScroll.CanvasSize=UDim2.new(0,0,0,0)
+    LogScroll.CanvasPosition=Vector2.new(0,0)
+    for _,p in ipairs(pool) do p.frame.Visible=false; p.boundLog=nil end
+    LogCountLbl.Text="0 logs"
+    D.typeTag.Text=""; D.name.Text=""; D.path.Text=""
+    D.args.Text=""; D.argsExp.Text=""
+end)
+
+-- Filtro
+SearchBox:GetPropertyChangedSignal("Text"):Connect(function()
+    RSP.Filter=SearchBox.Text:lower()
+    rebuildFiltered()
+    LogScroll.CanvasPosition=Vector2.new(0,0)
+    renderList()
+end)
+
+-- Callback novo log
+onLog(function(log)
+    -- Verificar tipos habilitados
+    if log.type=="FireServer"    and not RSP.Settings.FireServer    then return end
+    if log.type=="InvokeServer"  and not RSP.Settings.InvokeServer  then return end
+    if log.type=="OnClientEvent" and not RSP.Settings.OnClientEvent then return end
+    if log.type=="OnClientInvoke"and not RSP.Settings.OnClientInvoke then return end
+    if (log.type=="Fire" or log.type=="Invoke") and not RSP.Settings.Bindables then return end
+
+    rebuildFiltered()
+    LogCountLbl.Text=#filteredLogs.." logs"
+
+    if RSP.Settings.AutoScroll then
+        task.defer(function()
+            local total=#filteredLogs
+            local h=math.max(0,total*ITEM_S)
+            LogScroll.CanvasSize=UDim2.new(0,0,0,h)
+            local vis=LogScroll.AbsoluteSize.Y
+            LogScroll.CanvasPosition=Vector2.new(0,math.max(0,h-vis))
+            renderList()
+        end)
+    else
+        task.defer(renderList)
+    end
+end)
+
+-- ════════════════════════════════════════
+-- ABA REMOTES
+-- ════════════════════════════════════════
+local RemHdr=N("Frame",{Size=UDim2.new(1,0,0,36),BackgroundColor3=C.Surface,
+    BorderSizePixel=0,Parent=RFrame},{Pad(4,8),
+    N("UIListLayout",{FillDirection=Enum.FillDirection.Horizontal,
+        VerticalAlignment=Enum.VerticalAlignment.Center,Padding=UDim.new(0,6)})})
+Lbl("Remotes detectados",12,C.TextD,Enum.Font.GothamBold,{
+    Size=UDim2.new(1,-110,0,26),Parent=RemHdr})
+local RefreshBtn=Btn("🔄 Scan",11,{Size=UDim2.new(0,100,0,26),
+    BackgroundColor3=C.AccentD,Parent=RemHdr},{Rnd(6)})
+Div({Position=UDim2.new(0,0,0,36),Parent=RFrame})
+
+local RemScroll=N("ScrollingFrame",{Size=UDim2.new(1,0,1,-37),
+    Position=UDim2.new(0,0,0,37),BackgroundTransparency=1,BorderSizePixel=0,
+    ScrollBarThickness=4,ScrollBarImageColor3=C.Border,
+    CanvasSize=UDim2.new(0,0,0,0),Parent=RFrame})
+local RemContent=N("Frame",{Size=UDim2.new(1,0,0,0),BackgroundTransparency=1,
+    Parent=RemScroll},{
+    N("UIListLayout",{SortOrder=Enum.SortOrder.Name,Padding=UDim.new(0,2)}),
+    Pad(4,6)})
+local remLayout=RemContent:FindFirstChildOfClass("UIListLayout")
+remLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+    RemScroll.CanvasSize=UDim2.new(0,0,0,remLayout.AbsoluteContentSize.Y+16)
+end)
+
+local function refreshRemotes()
+    for _,c in ipairs(RemContent:GetChildren()) do if c:IsA("Frame") then c:Destroy() end end
+    local found={}
+    local function scan(p)
+        pcall(function()
+            for _,o in ipairs(p:GetDescendants()) do
+                local cls=o.ClassName
+                if cls=="RemoteEvent" or cls=="RemoteFunction"
+                or cls=="BindableEvent" or cls=="BindableFunction" then
+                    local path=safePath(o)
+                    if not found[path] then found[path]={inst=o,cls=cls,name=o.Name,path=path} end
+                end
+            end
+        end)
+    end
+    pcall(scan, game:GetService("ReplicatedStorage"))
+    pcall(scan, game:GetService("ReplicatedFirst"))
+    pcall(scan, workspace)
+    pcall(scan, LocalPlayer)
+    for _,log in ipairs(RSP.Logs) do
+        if log.remotePath and not found[log.remotePath] then
+            found[log.remotePath]={inst=log.remote,cls=log.remoteType,
+                name=log.remoteName,path=log.remotePath,fromLog=true}
+        end
+    end
+    local clrMap={RemoteEvent=C.FireServer,RemoteFunction=C.InvokeServer,
+        BindableEvent=C.Fire,BindableFunction=C.Invoke}
+    local count=0
+    for path,data in pairs(found) do
+        count=count+1
+        local stats=RSP.Stats[path] or {calls=0}
+        local isBlk=RSP.Blocked[path]
+        local clr=clrMap[data.cls] or C.TextD
+        local row=N("Frame",{Name=path,Size=UDim2.new(1,0,0,36),
+            BackgroundColor3=C.Surface,BorderSizePixel=0,Parent=RemContent},{Rnd(5),Pad(0,10)})
+        N("Frame",{Size=UDim2.new(0,3,1,0),BackgroundColor3=isBlk and C.Error or clr,
+            BorderSizePixel=0,Parent=row},{Rnd(2)})
+        Lbl(data.name or "?",12,C.Text,Enum.Font.GothamBold,{Size=UDim2.new(0.38,0,1,0),
+            Position=UDim2.new(0,10,0,0),TextTruncate=Enum.TextTruncate.AtEnd,Parent=row})
+        Lbl(data.cls or "",10,clr,Enum.Font.Gotham,{Size=UDim2.new(0.26,0,1,0),
+            Position=UDim2.new(0.38,8,0,0),Parent=row})
+        Lbl(string.format("📞 %d",stats.calls),10,C.TextD,Enum.Font.Gotham,{
+            Size=UDim2.new(0.15,0,1,0),Position=UDim2.new(0.64,0,0,0),Parent=row})
+        local bb=Btn(isBlk and "✅ Permitir" or "🚫 Bloquear",10,{
+            Size=UDim2.new(0,80,0,22),Position=UDim2.new(1,-84,0.5,-11),
+            BackgroundColor3=isBlk and Color3.fromRGB(20,50,25) or Color3.fromRGB(55,22,22),
+            TextColor3=isBlk and C.Success or C.Error,Parent=row},{Rnd(5)})
+        local bar=row:FindFirstChildOfClass("Frame")
+        bb.MouseButton1Click:Connect(function()
+            local blk=not RSP.Blocked[path]
+            RSP.Blocked[path]=blk or nil
+            bb.Text=blk and "✅ Permitir" or "🚫 Bloquear"
+            bb.BackgroundColor3=blk and Color3.fromRGB(20,50,25) or Color3.fromRGB(55,22,22)
+            bb.TextColor3=blk and C.Success or C.Error
+            bar.BackgroundColor3=blk and C.Error or clr
+        end)
+    end
+    if count==0 then
+        Lbl("Nenhum remote encontrado.\nDispare eventos ou jogue um pouco primeiro.",
+            12,C.TextM,Enum.Font.Gotham,{Size=UDim2.new(1,0,0,60),
+            TextXAlignment=Enum.TextXAlignment.Center,TextWrapped=true,Parent=RemContent})
+    end
+end
+RefreshBtn.MouseButton1Click:Connect(refreshRemotes)
+RBtn.MouseButton1Click:Connect(refreshRemotes)
+
+-- ════════════════════════════════════════
+-- ABA BLOCK
+-- ════════════════════════════════════════
+local BlkHdr=N("Frame",{Size=UDim2.new(1,0,0,36),BackgroundColor3=C.Surface,
+    BorderSizePixel=0,Parent=BFrame},{Pad(4,8),
+    N("UIListLayout",{FillDirection=Enum.FillDirection.Horizontal,
+        VerticalAlignment=Enum.VerticalAlignment.Center,Padding=UDim.new(0,6)})})
+Lbl("Remotes bloqueados",12,C.TextD,Enum.Font.GothamBold,{
+    Size=UDim2.new(0.5,0,0,26),Parent=BlkHdr})
+local UnblockAllBtn=Btn("🔓 Desbloquear Todos",11,{Size=UDim2.new(0,155,0,26),
+    BackgroundColor3=Color3.fromRGB(55,38,15),TextColor3=C.Warning,Parent=BlkHdr},{Rnd(6)})
+local BlkScroll=N("ScrollingFrame",{Size=UDim2.new(1,0,1,-37),
+    Position=UDim2.new(0,0,0,37),BackgroundTransparency=1,BorderSizePixel=0,
+    ScrollBarThickness=4,ScrollBarImageColor3=C.Border,
+    CanvasSize=UDim2.new(0,0,0,0),Parent=BFrame})
+local BlkContent=N("Frame",{Size=UDim2.new(1,0,0,0),BackgroundTransparency=1,
+    Parent=BlkScroll},{N("UIListLayout",{SortOrder=Enum.SortOrder.Name,Padding=UDim.new(0,2)}),
+    Pad(4,6)})
+local blkLayout=BlkContent:FindFirstChildOfClass("UIListLayout")
+blkLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+    BlkScroll.CanvasSize=UDim2.new(0,0,0,blkLayout.AbsoluteContentSize.Y+16)
+end)
+local function refreshBlocked()
+    for _,c in ipairs(BlkContent:GetChildren()) do if c:IsA("Frame") then c:Destroy() end end
+    local any=false
+    for path,_ in pairs(RSP.Blocked) do
+        any=true
+        local row=N("Frame",{Name=path,Size=UDim2.new(1,0,0,34),
+            BackgroundColor3=Color3.fromRGB(35,14,14),BorderSizePixel=0,
+            Parent=BlkContent},{Rnd(5),Pad(0,10),
+            N("UIStroke",{Color=C.Error,Thickness=1,Transparency=0.65})})
+        Lbl("🚫 "..path,11,C.Text,Enum.Font.Gotham,{Size=UDim2.new(1,-96,1,0),
+            TextTruncate=Enum.TextTruncate.AtEnd,Parent=row})
+        Btn("✅ Permitir",10,{Size=UDim2.new(0,82,0,22),Position=UDim2.new(1,-86,0.5,-11),
+            BackgroundColor3=Color3.fromRGB(20,48,22),TextColor3=C.Success,Parent=row},{Rnd(5)})
+            .MouseButton1Click:Connect(function() RSP.Blocked[path]=nil; row:Destroy() end)
+    end
+    if not any then Lbl("Nenhum remote bloqueado.",11,C.TextM,Enum.Font.Gotham,{
+        Size=UDim2.new(1,0,0,40),TextXAlignment=Enum.TextXAlignment.Center,Parent=BlkContent}) end
+end
+BBtn.MouseButton1Click:Connect(refreshBlocked)
+UnblockAllBtn.MouseButton1Click:Connect(function() RSP.Blocked={}; refreshBlocked() end)
+
+-- ════════════════════════════════════════
+-- ABA CONFIG
+-- ════════════════════════════════════════
+local CfgScroll=N("ScrollingFrame",{Size=UDim2.new(1,0,1,0),BackgroundTransparency=1,
+    BorderSizePixel=0,ScrollBarThickness=4,ScrollBarImageColor3=C.Border,
+    CanvasSize=UDim2.new(0,0,0,0),Parent=SFrame})
+local CfgContent=N("Frame",{Size=UDim2.new(1,0,0,0),BackgroundTransparency=1,Parent=CfgScroll},{
+    N("UIListLayout",{SortOrder=Enum.SortOrder.LayoutOrder,Padding=UDim.new(0,5)}),Pad(8,12)})
+local cfgLayout=CfgContent:FindFirstChildOfClass("UIListLayout")
+cfgLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+    CfgScroll.CanvasSize=UDim2.new(0,0,0,cfgLayout.AbsoluteContentSize.Y+24)
+end)
+local function CfgSec(txt,order)
+    Lbl(txt,9,C.TextM,Enum.Font.GothamBold,{Size=UDim2.new(1,0,0,18),LayoutOrder=order,Parent=CfgContent})
+end
+local function CfgTog(label,key,order)
+    local row=N("Frame",{Size=UDim2.new(1,0,0,30),BackgroundColor3=C.Surface,
+        BorderSizePixel=0,LayoutOrder=order,Parent=CfgContent},{Rnd(6),Pad(0,10)})
+    Lbl(label,12,C.Text,Enum.Font.Gotham,{Size=UDim2.new(1,-50,1,0),Parent=row})
+    local on=RSP.Settings[key]
+    local bg=N("Frame",{Size=UDim2.new(0,36,0,16),Position=UDim2.new(1,-40,0.5,-8),
+        BackgroundColor3=on and C.Accent or C.Border,BorderSizePixel=0,Parent=row},{Rnd(8)})
+    local knob=N("Frame",{Size=UDim2.new(0,10,0,10),
+        Position=UDim2.new(on and 1 or 0,on and -13 or 3,0.5,-5),
+        BackgroundColor3=Color3.new(1,1,1),BorderSizePixel=0,Parent=bg},{Rnd(5)})
+    N("TextButton",{Text="",Size=UDim2.new(1,0,1,0),BackgroundTransparency=1,Parent=bg})
+        .MouseButton1Click:Connect(function()
+            RSP.Settings[key]=not RSP.Settings[key]
+            local v=RSP.Settings[key]
+            TweenService:Create(bg,TweenInfo.new(0.14),{BackgroundColor3=v and C.Accent or C.Border}):Play()
+            TweenService:Create(knob,TweenInfo.new(0.14),{
+                Position=UDim2.new(v and 1 or 0,v and -13 or 3,0.5,-5)}):Play()
+        end)
+end
+CfgSec("── Tipos de Remote ──",1)
+CfgTog("FireServer (Client → Server)",     "FireServer",    2)
+CfgTog("InvokeServer (Client → Server)",   "InvokeServer",  3)
+CfgTog("OnClientEvent (Server → Client)",  "OnClientEvent", 4)
+CfgTog("OnClientInvoke (Server → Client)", "OnClientInvoke",5)
+CfgTog("Bindables (BindableEvent/Function)","Bindables",    6)
+CfgSec("── Interface ──",7)
+CfgTog("Auto Scroll","AutoScroll",8)
+-- Max args
+local maxRow=N("Frame",{Size=UDim2.new(1,0,0,30),BackgroundColor3=C.Surface,
+    BorderSizePixel=0,LayoutOrder=9,Parent=CfgContent},{Rnd(6),Pad(0,10)})
+local maxLbl=Lbl("Máximo de args: "..RSP.Settings.MaxArgs,12,C.Text,Enum.Font.Gotham,{
+    Size=UDim2.new(0.6,0,1,0),Parent=maxRow})
+Btn("−",13,{Size=UDim2.new(0,24,0,18),Position=UDim2.new(1,-56,0.5,-9),
+    BackgroundColor3=C.Panel,Parent=maxRow},{Rnd(4)})
+    .MouseButton1Click:Connect(function()
+        RSP.Settings.MaxArgs=math.max(1,RSP.Settings.MaxArgs-1)
+        maxLbl.Text="Máximo de args: "..RSP.Settings.MaxArgs
+    end)
+Btn("+",13,{Size=UDim2.new(0,24,0,18),Position=UDim2.new(1,-28,0.5,-9),
+    BackgroundColor3=C.AccentD,Parent=maxRow},{Rnd(4)})
+    .MouseButton1Click:Connect(function()
+        RSP.Settings.MaxArgs=math.min(30,RSP.Settings.MaxArgs+1)
+        maxLbl.Text="Máximo de args: "..RSP.Settings.MaxArgs
+    end)
+CfgSec("── Ações ──",10)
+local actRow=N("Frame",{Size=UDim2.new(1,0,0,34),BackgroundTransparency=1,
+    LayoutOrder=11,Parent=CfgContent},{
+    N("UIListLayout",{FillDirection=Enum.FillDirection.Horizontal,
+        Padding=UDim.new(0,8),VerticalAlignment=Enum.VerticalAlignment.Center})})
+Btn("📤 Exportar JSON",11,{Size=UDim2.new(0,138,0,28),
+    BackgroundColor3=C.AccentD,Parent=actRow},{Rnd(6)})
+    .MouseButton1Click:Connect(function()
+        if not ENV.CanCopy then return end
+        local out={}
+        for _,l in ipairs(RSP.Logs) do
+            out[#out+1]={id=l.id,timestamp=l.timestamp,type=l.type,
+                remoteType=l.remoteType,remoteName=l.remoteName,
+                remotePath=l.remotePath,argsFormatted=l.argsFormatted,
+                blocked=l.blocked,callerScript=l.callerScript,
+                callerLine=l.callerLine,direction=l.direction}
+        end
+        local ok,j=pcall(HttpService.JSONEncode,HttpService,out)
+        if ok then ENV.setclipboard(j) end
+    end)
+Btn("🗑 Limpar Tudo",11,{Size=UDim2.new(0,108,0,28),
+    BackgroundColor3=Color3.fromRGB(50,15,15),TextColor3=C.Error,Parent=actRow},{Rnd(6)})
+    .MouseButton1Click:Connect(function()
+        RSP.Logs={}; RSP.Stats={}; RSP.Blocked={}; filteredLogs={}; selectedLog=nil
+        LogScroll.CanvasSize=UDim2.new(0,0,0,0); LogScroll.CanvasPosition=Vector2.new(0,0)
+        for _,p in ipairs(pool) do p.frame.Visible=false; p.boundLog=nil end
+        LogCountLbl.Text="0 logs"
+    end)
+-- Info
+CfgSec("── Informações do Executor ──",12)
+local infoBox=N("Frame",{Size=UDim2.new(1,0,0,72),BackgroundColor3=C.Panel,
+    BorderSizePixel=0,LayoutOrder=13,Parent=CfgContent},{Rnd(6),Pad(6,10)})
+Lbl("Executor: "..ENV.Name,11,C.Text,Enum.Font.GothamBold,{
+    Size=UDim2.new(1,0,0,18),Parent=infoBox})
+local hmTxt=ENV.CanHookFunction and "hookfunction (protótipo)" or
+             ENV.CanHookMeta    and "hookmetamethod (__namecall)" or
+             "Fallback (patch instância)"
+Lbl("Hook: "..hmTxt,10,C.TextD,Enum.Font.Gotham,{
+    Size=UDim2.new(1,0,0,16),Position=UDim2.new(0,0,0,18),Parent=infoBox})
+Lbl("Clipboard: "..(ENV.CanCopy and "✅ disponível" or "❌ indisponível"),
+    10,C.TextD,Enum.Font.Gotham,{
+    Size=UDim2.new(1,0,0,16),Position=UDim2.new(0,0,0,34),Parent=infoBox})
+Lbl("hookfunction: "..tostring(ENV.CanHookFunction)
+    .."  |  hookmetamethod: "..tostring(ENV.CanHookMeta),
+    9,C.TextM,Enum.Font.Gotham,{
+    Size=UDim2.new(1,0,0,16),Position=UDim2.new(0,0,0,52),Parent=infoBox})
+
+-- ── DRAG ──
+do
+    local drag,ds,sp=false,nil,nil
+    HDR.InputBegan:Connect(function(i)
+        if i.UserInputType==Enum.UserInputType.MouseButton1 then
+            drag=true; ds=i.Position; sp=Win.Position end
+    end)
+    UserInputService.InputChanged:Connect(function(i)
+        if drag and i.UserInputType==Enum.UserInputType.MouseMovement then
+            local d=i.Position-ds
+            Win.Position=UDim2.new(sp.X.Scale,sp.X.Offset+d.X,sp.Y.Scale,sp.Y.Offset+d.Y) end
+    end)
+    UserInputService.InputEnded:Connect(function(i)
+        if i.UserInputType==Enum.UserInputType.MouseButton1 then drag=false end
+    end)
+end
+
+-- ── INICIALIZAÇÃO ──
+switchTab("Logs")
+
+Win.Size=UDim2.new(0,0,0,0)
+Win.Position=UDim2.new(0.5,0,0.5,0)
+TweenService:Create(Win,TweenInfo.new(0.3,Enum.EasingStyle.Back,Enum.EasingDirection.Out),{
+    Size=UDim2.new(0,WIN_W,0,WIN_H),
+    Position=UDim2.new(0.5,-WIN_W/2,0.5,-WIN_H/2)}):Play()
+
+-- Hooks em thread separada (não trava a UI)
+task.spawn(function()
+    task.wait(0.3)
+    initHooks()
+    addLog({
+        type="FireServer", remoteType="Sistema",
+        remoteName="RSP Inicializado", remotePath="System.RSP",
+        remote=nil, args={"executor="..ENV.Name,"hook="..hookMode},
+        blocked=false, direction="⚡ Sistema"
+    })
+end)
+
 print([[
-╔════════════════════════════════╗
-║   Remote Spy Pro v2.0 Ativo    ║
-║   Espionando todas as Remotes  ║
-╚════════════════════════════════╝
-]])
+┌────────────────────────────────────┐
+│   Remote Spy Pro v3.0  ativo!      │
+│   RSP.Enabled=false  → pausar      │
+│   RSP.Blocked[path]=true→bloquear  │
+│   RSP.Logs  → acessar logs         │
+└────────────────────────────────────┘]])
