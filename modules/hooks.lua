@@ -63,6 +63,40 @@ local function safePath(inst)
     return ok and r or tostring(inst)
 end
 
+-- detecta se o nome tem caracteres invisíveis (zero-width, controle, etc)
+-- se tiver, retorna nome "amigável" em hex + flag
+local function processName(name)
+    if type(name) ~= "string" or name == "" then
+        return "<empty>", true, ""
+    end
+    local isHidden = false
+    local hex = {}
+    for i = 1, #name do
+        local b = string.byte(name, i)
+        hex[i] = string.format("%02X", b)
+        if b < 32 or b == 127 then isHidden = true end
+    end
+    -- heurística: zero-width chars em unicode (E2 80 8B..8F, etc)
+    if name:find("[\194-\244]") then
+        for i = 1, #name-1 do
+            local a, b = string.byte(name, i), string.byte(name, i+1)
+            if a == 0xE2 and b == 0x80 then isHidden = true; break end
+            if a == 0xEF and b == 0xBB then isHidden = true; break end
+        end
+    end
+    if isHidden then
+        return string.format("<hidden:%s>", table.concat(hex)), true, table.concat(hex)
+    end
+    return name, false, table.concat(hex)
+end
+
+-- gera chave estável do remote (prefere DebugId se disponível)
+local function stableKey(inst)
+    local ok, dbgId = pcall(function() return game:GetDebugId(inst) end)
+    if ok and dbgId then return dbgId end
+    return safePath(inst)
+end
+
 function M.init(env, callback)
     if M._installed then return false, "já instalado" end
     M._installed = true
@@ -114,19 +148,44 @@ function M.init(env, callback)
         elseif method == "InvokeServer" then M.stats.is = M.stats.is + 1 end
         if metamethod == "__namecall" then M.stats.ns = M.stats.ns + 1 end
 
-        callback({
+        local rawName = self.Name
+        local displayName, hiddenFlag, nameHex = processName(rawName)
+        local key = stableKey(self)
+        local path = safePath(self)
+
+        local data = {
             type       = method,
             remoteType = cls,
             remote     = self,
-            remoteName = self.Name,
-            remotePath = safePath(self),
+            remoteName = displayName,
+            remoteNameRaw = rawName,
+            remoteNameHidden = hiddenFlag,
+            remoteNameHex = nameHex,
+            remoteKey  = key,
+            remotePath = path,
             args       = args,
             argCount   = #args,
             callerScript = src,
             callerLine = ln,
             metamethod = metamethod,
-            blocked    = env.isBlocked and env.isBlocked(self) or false,
-        })
+        }
+
+        -- isBlocked recebe data completa e retorna {blocked=bool, reason=str, silent=bool}
+        local blockRes = nil
+        if env.checkBlock then
+            blockRes = env.checkBlock(data)
+        end
+        data.blocked = blockRes and blockRes.blocked or false
+        data.blockReason = blockRes and blockRes.reason
+
+        -- se é pra silenciar (não loga nem dispara), pula totalmente
+        if blockRes and blockRes.silent then
+            -- não loga, não dispara
+            return "SILENT_BLOCK"
+        end
+
+        callback(data)
+        return data.blocked and "BLOCK" or nil
     end
 
     -- ── MÉTODO 1: __namecall via hookmetamethod ──
@@ -146,9 +205,8 @@ function M.init(env, callback)
                         end)
                         if isRemote then
                             local args = {...}
-                            local blocked = env.isBlocked and env.isBlocked(self)
-                            emit(method, self, args, "__namecall")
-                            if blocked then
+                            local result = emit(method, self, args, "__namecall")
+                            if result == "BLOCK" or result == "SILENT_BLOCK" then
                                 if method == "InvokeServer" then return nil end
                                 return
                             end
@@ -178,9 +236,8 @@ function M.init(env, callback)
                 M._originals[key] = hookfunction(orig, newcclosure(function(self, ...)
                     if typeof(self) == "Instance" then
                         local args = {...}
-                        local blocked = env.isBlocked and env.isBlocked(self)
-                        emit(methodName, self, args, "hookfunction")
-                        if blocked then
+                        local result = emit(methodName, self, args, "hookfunction")
+                        if result == "BLOCK" or result == "SILENT_BLOCK" then
                             if methodName == "InvokeServer" then return nil end
                             return
                         end
@@ -196,7 +253,6 @@ function M.init(env, callback)
 
         hookProto("RemoteEvent", "FireServer", "FireServer")
         hookProto("RemoteFunction", "InvokeServer", "InvokeServer")
-        -- UnreliableRemoteEvent só existe em versões recentes, falha silenciosa ok
         pcall(function()
             hookProto("UnreliableRemoteEvent", "FireServer", "UnreliableFireServer")
         end)
@@ -218,17 +274,31 @@ function M.init(env, callback)
                 M.stats.ce = M.stats.ce + 1
                 local args = {...}
                 if isCyclic(args) then return end
-                callback({
+
+                local rawName = obj.Name
+                local displayName, hiddenFlag, nameHex = processName(rawName)
+                local key = stableKey(obj)
+                local path = safePath(obj)
+
+                local data = {
                     type       = "OnClientEvent",
                     remoteType = "RemoteEvent",
                     remote     = obj,
-                    remoteName = obj.Name,
-                    remotePath = safePath(obj),
+                    remoteName = displayName,
+                    remoteNameRaw = rawName,
+                    remoteNameHidden = hiddenFlag,
+                    remoteNameHex = nameHex,
+                    remoteKey  = key,
+                    remotePath = path,
                     args       = deepclone(args),
                     argCount   = #args,
                     metamethod = "passive",
-                    blocked    = false,
-                })
+                }
+                local blockRes = env.checkBlock and env.checkBlock(data)
+                if blockRes and blockRes.silent then return end
+                data.blocked = blockRes and blockRes.blocked or false
+                data.blockReason = blockRes and blockRes.reason
+                callback(data)
             end)
         end)
     end

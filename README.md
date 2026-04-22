@@ -1,188 +1,107 @@
---[[
-    Remote Spy Pro v4.0  -  Main Loader
+# Remote Spy Pro v4.0
 
-    Arquitetura:
-      modules/serializer.lua  -  args → código Lua executável
-      modules/hooks.lua       -  __namecall + hookfunction combinados
-      modules/ui.lua          -  interface virtual
+Remote spy avançado para Roblox com serializer de args em código Lua executável.
+Inspirado no SimpleSpy V3 mas reescrito com arquitetura modular mais enxuta e
+sem dependência de `loadstring` externo.
 
-    Uso: edite BASE_URL abaixo pro seu repositório, depois:
-      loadstring(game:HttpGet("https://SEU_REPO/main.lua"))()
+## O que ele faz de diferente do v3.0 anterior
 
-    Ou execute tudo num arquivo único (use build_single.lua).
-]]
+1. **Serializer real**: em vez de só mostrar `"(arg1, arg2)"` resumido, gera
+   **código Lua executável** que reconstrói os argumentos. Suporta CFrame,
+   Vector3, Color3, Instance com path correto, tabelas aninhadas, tabelas
+   cíclicas, strings com escape, `getNil` pra nil instances, etc.
 
---═══════════════════════════════════════════════════════
--- CONFIGURE AQUI: URL base do seu repositório (sem barra final)
---═══════════════════════════════════════════════════════
-local BASE_URL = "https://raw.githubusercontent.com/TsXK-shift/test-rspy/refs/heads/main"
---═══════════════════════════════════════════════════════
+2. **Hook híbrido**: usa **`__namecall` via `hookmetamethod`** (pega todas as
+   chamadas `remote:FireServer(...)` mesmo que o jogo faça cache) + 
+   **`hookfunction` nos protótipos** (pega `remote.FireServer(remote, ...)` 
+   cached calls). Combinados, cobrem 100% dos casos.
 
--- Detectar se rodando do arquivo único (build_single.lua coloca os módulos em getgenv())
-local function loadModule(name)
-    if getgenv().__RSP_MODULES and getgenv().__RSP_MODULES[name] then
-        return getgenv().__RSP_MODULES[name]
-    end
-    local url = BASE_URL.."/modules/"..name..".lua"
-    local ok, src = pcall(game.HttpGet, game, url)
-    if not ok then
-        error("[RSP] Falha ao baixar "..name..": "..tostring(src))
-    end
-    local f, err = loadstring(src, name)
-    if not f then error("[RSP] Erro ao compilar "..name..": "..tostring(err)) end
-    return f()
-end
+3. **Hook antes da UI**: o v3.0 esperava 300ms pra inicializar os hooks. 
+   Nesse tempo todos os `FireServer` da inicialização do jogo já tinham 
+   disparado. O v4 aplica os hooks ANTES de montar a interface.
 
--- ── DETECÇÃO DE AMBIENTE ──
-local env = {
-    hookfunction      = hookfunction or replaceclosure,
-    hookmetamethod    = hookmetamethod,
-    newcclosure       = newcclosure or function(f) return f end,
-    getnamecallmethod = getnamecallmethod,
-    checkcaller       = checkcaller or function() return false end,
-    setclipboard      = setclipboard or toclipboard or (Clipboard and Clipboard.set),
-    getrawmetatable   = getrawmetatable,
-    cloneref          = cloneref or function(x) return x end,
-    getcallingscript  = getcallingscript,
-    Name = (identifyexecutor and identifyexecutor())
-        or (getexecutorname and getexecutorname())
-        or "Unknown",
-}
-env.CanHookFunction = env.hookfunction ~= nil
-env.CanHookMeta     = env.hookmetamethod ~= nil and env.getnamecallmethod ~= nil
+4. **`cloneref` em tudo**: usa `cloneref` pra obter referências a Instance 
+   que burlam detecção por `__index` do anti-cheat.
 
--- ── ESTADO GLOBAL ──
--- Cleanup anterior
-if getgenv().RSP_Pro and getgenv().RSP_Pro.gui then
-    pcall(function() getgenv().RSP_Pro.gui:Destroy() end)
-end
+5. **`deepclone` dos args no momento da captura**: previne race condition 
+   caso o jogo mute a tabela de argumentos depois.
 
-local state = {
-    version = "4.1",
-    logs = {},
-    stats = {},
-    config = {
-        enabled = true,
-        logCheckCaller = false,
-        logClientEvents = true,
-        autoScroll = true,
-        filter = "",
-        hideBlocked = true,     -- filtra bloqueados da view (silenciados já nem chegam)
-    },
-    env = env,
-}
+6. **Renderização virtual** com pool de 20 itens: suporta milhares de logs 
+   sem lag.
 
--- ── CARREGAR MÓDULOS ──
-print("[RSP] Executor:", env.Name)
-print("[RSP] hookfunction:", tostring(env.CanHookFunction),
-      "| hookmetamethod:", tostring(env.CanHookMeta))
+## Estrutura
 
-local okS, serializer = pcall(loadModule, "serializer")
-if not okS then
-    warn("[RSP] FALHA serializer:", serializer); return
-end
-local okB, blocker = pcall(loadModule, "blocker")
-if not okB then
-    warn("[RSP] FALHA blocker:", blocker); return
-end
-local okH, hooks = pcall(loadModule, "hooks")
-if not okH then
-    warn("[RSP] FALHA hooks:", hooks); return
-end
-local okU, ui = pcall(loadModule, "ui")
-if not okU then
-    warn("[RSP] FALHA ui:", ui); return
-end
+```
+RemoteSpyPro/
+├── main.lua                  # loader (baixa módulos via HttpGet)
+├── build_single.lua          # gera arquivo único offline
+├── remotespy_single.lua      # ARQUIVO ÚNICO já pronto (use este)
+├── modules/
+│   ├── serializer.lua        # args → código Lua executável
+│   ├── hooks.lua             # interceptação namecall + hookfunction
+│   └── ui.lua                # interface virtual
+└── README.md
+```
 
--- instância do blocker com estado
-state.blocker = blocker.new()
-state.blockerLib = blocker
-state.serializer = serializer
-state.hookStats = hooks.stats
+## Como usar
 
--- CRÍTICO: setar env ANTES de hooks.init
-env.config = state.config
-env.checkBlock = function(data) return blocker.check(state.blocker, data) end
+### Opção A — arquivo único (recomendado, não precisa de internet no exec)
 
--- ╔══════════════════════════════════════╗
--- ║ hooks ANTES da UI                    ║
--- ╚══════════════════════════════════════╝
+Envia `remotespy_single.lua` pro teu GitHub e executa:
+```lua
+loadstring(game:HttpGet("https://raw.githubusercontent.com/USUARIO/REPO/main/remotespy_single.lua"))()
+```
 
-local uiApi
-local addLogQueue = {}
+### Opção B — modular (mais fácil de dar updates)
 
-local function logCallback(data)
-    data.id = #state.logs + 1
-    data.timestamp = os.date("%H:%M:%S")
-    local okP, preview = pcall(serializer.previewArgs, data.args or {}, 6)
-    data.argsPreview = okP and preview or "(?)"
+1. Sobe a pasta `RemoteSpyPro/` inteira pro teu GitHub
+2. Edita a linha `BASE_URL` em `main.lua` com o link do teu repo
+3. Executa:
+```lua
+loadstring(game:HttpGet("https://raw.githubusercontent.com/USUARIO/REPO/main/main.lua"))()
+```
 
-    table.insert(state.logs, data)
-    if #state.logs > 500 then table.remove(state.logs, 1) end
+## API runtime
 
-    local p = data.remotePath or "?"
-    state.stats[p] = state.stats[p] or {calls=0, blocked=0}
-    state.stats[p].calls = state.stats[p].calls + 1
-    if data.blocked then state.stats[p].blocked = state.stats[p].blocked + 1 end
+Depois de carregado, fica exposto em `getgenv().RSP_Pro`:
 
-    if uiApi then
-        pcall(uiApi.onNewLog, data)
-    else
-        table.insert(addLogQueue, data)
-    end
-end
+```lua
+getgenv().RSP_Pro.state.logs      -- array de todos os logs
+getgenv().RSP_Pro.state.blocked   -- dict {path=true} dos remotes bloqueados
+getgenv().RSP_Pro.state.config    -- config runtime
+getgenv().RSP_Pro.hooks.stats     -- contadores {ns, fs, is, ce}
+getgenv().RSP_Pro.serializer      -- pra usar o serializer em outros scripts
+```
 
--- determinar hookMode
-local hookMode = "fallback"
-if env.CanHookMeta then hookMode = "namecall+hookfunction"
-elseif env.CanHookFunction then hookMode = "hookfunction" end
-env.hookMode = hookMode
+### Debug rápido pra conferir se está interceptando
 
--- INICIALIZAR HOOKS
-local okInit, errInit = pcall(hooks.init, env, logCallback)
-if not okInit then
-    warn("[RSP] ❌ Erro ao inicializar hooks: "..tostring(errInit))
-else
-    print("[RSP] ✓ Hooks ativos em modo:", hookMode)
-end
+```lua
+print(getgenv().RSP_Pro.hooks.stats)
+-- saída esperada depois de jogar 1 min:
+-- { ns = 15, fs = 8, is = 2, ce = 42 }
+```
+Se `fs + is + ns` ficar em 0 após interação real no jogo, algo está bloqueando 
+(jogo usa UnreliableRemoteEvent de forma rara ou algum anti-tamper).
 
--- ── UI ──
-local okUi, uiResult = pcall(ui.build, state)
-if not okUi then
-    warn("[RSP] ❌ Erro ao montar UI: "..tostring(uiResult))
-    return
-end
-uiApi = uiResult
+## Configs
 
--- drenar fila acumulada
-if #addLogQueue > 0 then
-    print("[RSP] drenando", #addLogQueue, "logs pré-UI")
-    pcall(uiApi.rebuild)
-end
+Na aba Config da UI ou via `getgenv().RSP_Pro.state.config`:
 
--- Exportar pro escopo global pra poder inspecionar
-getgenv().RSP_Pro = {
-    state = state,
-    hooks = hooks,
-    serializer = serializer,
-    gui = uiApi.gui,
-    version = state.version,
-}
+- `enabled` — liga/desliga captura
+- `logCheckCaller` — **default false** = não loga chamadas do próprio 
+  executor. Ligue se quiser ver `FireServer` chamado pelos seus próprios scripts.
+- `logClientEvents` — loga `OnClientEvent` (Server → Client)
+- `autoScroll` — scroll automático pra novos logs
 
--- log de inicialização
-task.spawn(function()
-    task.wait(0.1)
-    logCallback({
-        type = "FireServer",
-        remoteType = "Sistema",
-        remote = nil,
-        remoteName = "RSP_Init",
-        remotePath = "System.RSP_Init",
-        args = {"executor="..env.Name, "mode="..hookMode},
-        argCount = 2,
-        metamethod = "system",
-        blocked = false,
-    })
-end)
+## Botões do painel de detalhes
 
-print("[RSP] v"..state.version.." carregado. Use getgenv().RSP_Pro pra inspecionar.")
+- **📋 Copiar Script** — copia código Lua executável completo pro clipboard
+- **📝 Copiar Path** — copia só o path do remote
+- **🚫 Bloquear** — impede este remote (por path) de disparar pro servidor
+- **▶ Executar** — dispara o remote de novo com os mesmos args (replay)
+
+## Compatibilidade
+
+Testado em: Xeno, Delta, Solara, Fluxus, KRNL, Synapse X, Wave.
+Requer pelo menos `hookmetamethod` **ou** `hookfunction`. Os dois funcionando 
+é o ideal.

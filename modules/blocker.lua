@@ -104,11 +104,75 @@ local function matchGroup(value, data)
     return groupKey(data) == value
 end
 
+-- signature: identifica remotes "funcionalmente iguais"
+-- assinatura = path + tipos dos args + valores dos args primitivos pequenos
+-- ex: FireServer(970, {"Items","InUse"}, {algo grande}) → assinatura captura 970 e {"Items","InUse"}
+--     mas ignora o 3º arg (table grande). Isso faz pegar todos os updates de "Items.InUse"
+--     independente do conteúdo.
+
+local function argSignature(v, depth)
+    depth = depth or 0
+    if depth > 3 then return "~" end
+    local t = typeof(v)
+    if t == "nil" then return "n"
+    elseif t == "boolean" then return tostring(v)
+    elseif t == "number" then
+        -- números inteiros pequenos entram na assinatura (IDs, codes)
+        if v == math.floor(v) and math.abs(v) < 100000 then
+            return tostring(v)
+        end
+        return "#"  -- número variável
+    elseif t == "string" then
+        -- strings curtas entram na assinatura (comandos, chaves)
+        if #v <= 32 then return '"'..v..'"' end
+        return "$"
+    elseif t == "Instance" then
+        local ok, cls = pcall(function() return v.ClassName end)
+        return "I:"..(ok and cls or "?")
+    elseif t == "table" then
+        -- conta tamanho + inclui chaves pequenas
+        local count = 0
+        local keys = {}
+        for k in pairs(v) do
+            count = count + 1
+            if count > 6 then break end
+            if type(k) == "string" and #k <= 32 then
+                keys[#keys+1] = k
+            elseif type(k) == "number" then
+                keys[#keys+1] = "#"..k
+            end
+        end
+        table.sort(keys)
+        return "{"..table.concat(keys, ",").."}"
+    elseif t == "Vector3" or t == "Vector2" or t == "CFrame" then
+        return t  -- posição varia muito, só tipo
+    elseif t == "Color3" then
+        return "C"
+    elseif t == "EnumItem" then
+        return tostring(v)  -- enum é valor fixo
+    end
+    return "?"
+end
+
+local function signatureKey(data)
+    local parts = { data.remotePath or "?", data.type or "?" }
+    local args = data.args or {}
+    for i = 1, math.min(#args, 5) do
+        parts[#parts+1] = argSignature(args[i], 0)
+    end
+    return table.concat(parts, "|")
+end
+
+local function matchSignature(value, data)
+    return signatureKey(data) == value
+end
+
 local matchers = {
-    exact    = matchExact,
-    pattern  = matchPattern,
-    wildcard = matchWildcard,
-    group    = matchGroup,
+    exact     = matchExact,
+    pattern   = matchPattern,
+    wildcard  = matchWildcard,
+    group     = matchGroup,
+    signature = matchSignature,
 }
 
 -- ── API ──
@@ -152,25 +216,29 @@ end
 -- função chamada a cada remote interceptado
 -- retorna { blocked=bool, silent=bool, reason=str } ou nil
 function M.check(inst, data)
-    -- 1. check spam tracking
-    local key = groupKey(data)
+    -- 1. check spam tracking por SIGNATURE (mais específico que group)
+    -- isso detecta "mesmo remote com mesmos primeiros args" — perfeito pra
+    -- pegar updates periódicos de replica/timer que compartilham estrutura
+    local key = signatureKey(data)
     local now = os.clock()
     local s = inst.spamStats[key]
     if not s then
-        s = { count=0, windowStart=now, lastSeen=now, sample=data.remotePath }
+        s = { count=0, windowStart=now, lastSeen=now,
+              sample=data.remotePath, sampleData=data }
         inst.spamStats[key] = s
     end
     if now - s.windowStart > inst.config.windowSeconds then
-        -- reinicia janela
         s.count = 0
         s.windowStart = now
     end
     s.count = s.count + 1
     s.lastSeen = now
+    s.sampleData = data  -- sempre guarda mais recente pra preview
     local rate = s.count / math.max(0.1, now - s.windowStart)
     if rate > inst.config.autoBlockThreshold and not inst.suggestedBlocks[key] then
         inst.suggestedBlocks[key] = {
             sample = data.remotePath,
+            sampleData = data,
             rate = rate,
             suggestedAt = now,
         }
@@ -197,8 +265,9 @@ function M.getSuggestions(inst)
     local list = {}
     for key, sug in pairs(inst.suggestedBlocks) do
         list[#list+1] = {
-            groupKey = key,
+            signatureKey = key,
             sample = sug.sample,
+            sampleData = sug.sampleData,
             rate = sug.rate,
         }
     end
@@ -206,17 +275,18 @@ function M.getSuggestions(inst)
     return list
 end
 
-function M.acceptSuggestion(inst, groupKeyValue, silent)
-    M.addRule(inst, "group", groupKeyValue, { silent = silent ~= false })
-    inst.suggestedBlocks[groupKeyValue] = nil
+function M.acceptSuggestion(inst, signatureKeyValue, silent)
+    M.addRule(inst, "signature", signatureKeyValue, { silent = silent ~= false })
+    inst.suggestedBlocks[signatureKeyValue] = nil
 end
 
-function M.dismissSuggestion(inst, groupKeyValue)
-    inst.suggestedBlocks[groupKeyValue] = nil
+function M.dismissSuggestion(inst, signatureKeyValue)
+    inst.suggestedBlocks[signatureKeyValue] = nil
 end
 
 -- helpers expostos
 M.groupKey = groupKey
+M.signatureKey = signatureKey
 M.nameShape = nameShape
 M.parentPath = parentPath
 M.leafName = leafName

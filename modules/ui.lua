@@ -156,6 +156,10 @@ function M.build(state)
     local CountLbl = Lbl("0 logs", 11, C.TextD, Enum.Font.Gotham, {
         Size=UDim2.new(0,120,0,26), Position=UDim2.new(0,260,0.5,-13), Parent=TopBar})
 
+    local ExportBtn = Btn("📤 Exportar", 11, {Size=UDim2.new(0,94,0,26),
+        Position=UDim2.new(1,-188,0.5,-13),
+        BackgroundColor3=C.AccentD, Parent=TopBar}, {Rnd(5)})
+
     local ClearBtn = Btn("🗑 Limpar", 11, {Size=UDim2.new(0,80,0,26),
         Position=UDim2.new(1,-88,0.5,-13),
         BackgroundColor3=Color3.fromRGB(50,18,18), TextColor3=C.Error,
@@ -243,14 +247,35 @@ function M.build(state)
         return (h - vis - y) <= SCROLL_THRESHOLD
     end
 
+    local function logMatchesBlockRule(log)
+        for _, r in ipairs(state.blocker.rules) do
+            if r.type == "exact" and r.value == log.remotePath then return true end
+            if r.type == "group" and state.blockerLib.groupKey(log) == r.value then return true end
+            if r.type == "signature" and state.blockerLib.signatureKey(log) == r.value then return true end
+            if r.type == "wildcard" then
+                local pat = r.value:gsub("([%(%)%[%]%+%-%^%$%?%.])", "%%%1"):gsub("%%%*", ".-")
+                if log.remotePath:match("^"..pat.."$") then return true end
+            end
+            if r.type == "pattern" then
+                local ok, res = pcall(string.find, log.remotePath, r.value)
+                if ok and res then return true end
+            end
+        end
+        return false
+    end
+
     local function rebuildFiltered()
         filtered = {}
         local f = state.config.filter or ""
+        local hide = state.config.hideBlocked
         for _, log in ipairs(state.logs) do
-            if f == "" or
+            if hide and logMatchesBlockRule(log) then
+                -- pula: bloqueado e usuário quer esconder
+            elseif f == "" or
                (log.remoteName or ""):lower():find(f,1,true) or
                (log.remotePath or ""):lower():find(f,1,true) or
-               (log.type or ""):lower():find(f,1,true) then
+               (log.type or ""):lower():find(f,1,true) or
+               (log.remoteNameRaw or ""):lower():find(f,1,true) then
                 filtered[#filtered+1] = log
             end
         end
@@ -274,11 +299,18 @@ function M.build(state)
                 pi.log = log
                 pi.item.Visible = true
                 pi.item.Position = UDim2.new(0,3,0,(idx-1)*ITEM_S)
-                pi.bar.BackgroundColor3 = log.blocked and C.Error or clr
+                local isBlocked = log.blocked or logMatchesBlockRule(log)
+                pi.bar.BackgroundColor3 = isBlocked and C.Error or clr
                 pi.tagLbl.TextColor3 = clr
                 pi.tagLbl.Text = log.type or ""
-                pi.nameLbl.Text = log.remoteName or "?"
-                pi.nameLbl.TextColor3 = log.blocked and C.Error or C.Text
+                -- se nome escondido (hex), mostra em amarelo pra destacar
+                if log.remoteNameHidden then
+                    pi.nameLbl.Text = "⚠ "..(log.remoteName or "?")
+                    pi.nameLbl.TextColor3 = isBlocked and C.Error or C.Warning
+                else
+                    pi.nameLbl.Text = log.remoteName or "?"
+                    pi.nameLbl.TextColor3 = isBlocked and C.Error or C.Text
+                end
                 pi.argsLbl.Text = log.argsPreview or ""
                 pi.timeLbl.Text = log.timestamp or ""
                 pi.item.BackgroundColor3 = (selected == log) and C.PanelH or C.Panel
@@ -345,7 +377,8 @@ function M.build(state)
         Size=UDim2.new(1,0,0,14), Position=UDim2.new(0,0,0,32), Parent=DInfoFrame})
 
     -- code box: mostra script Lua executável gerado
-    local CodeContainer = N("Frame",{Size=UDim2.new(1,-16,1,-152),
+    -- (altura ajustada pra dar espaço aos 2 rows de botões embaixo: 74+16 = 90px)
+    local CodeContainer = N("Frame",{Size=UDim2.new(1,-16,1,-190),
         Position=UDim2.new(0,8,0,100), BackgroundColor3=C.BG,
         BorderSizePixel=0, Parent=DetailPanel}, {Rnd(5)})
     local CodeScroll = N("ScrollingFrame",{Size=UDim2.new(1,0,1,0),
@@ -359,19 +392,40 @@ function M.build(state)
         TextYAlignment=Enum.TextYAlignment.Top, TextWrapped=false,
         Parent=CodeScroll})
 
-    -- ações
-    local ActBar = N("Frame",{Size=UDim2.new(1,-16,0,34),
-        Position=UDim2.new(0,8,1,-42), BackgroundTransparency=1, Parent=DetailPanel})
+    -- ações (2 linhas pra caber bem)
+    local ActBar = N("Frame",{Size=UDim2.new(1,-16,0,66),
+        Position=UDim2.new(0,8,1,-74), BackgroundTransparency=1, Parent=DetailPanel})
 
-    local CopyScriptBtn = Btn("📋 Copiar Script", 11, {Size=UDim2.new(0,130,1,0),
+    -- LINHA 1: cópia + executar
+    local CopyScriptBtn = Btn("📋 Copiar Script", 11, {Size=UDim2.new(0,130,0,28),
         Position=UDim2.new(0,0,0,0), BackgroundColor3=C.AccentD,
         Parent=ActBar}, {Rnd(5)})
-    local CopyPathBtn = Btn("📝 Copiar Path", 11, {Size=UDim2.new(0,112,1,0),
+    local CopyPathBtn = Btn("📝 Path", 11, {Size=UDim2.new(0,70,0,28),
         Position=UDim2.new(0,136,0,0), BackgroundColor3=C.Panel,
         Parent=ActBar}, {Rnd(5)})
-    local BlockBtn = Btn("🚫 Bloquear", 11, {Size=UDim2.new(0,100,1,0),
-        Position=UDim2.new(0,254,0,0),
+    local CopyArgsBtn = Btn("📦 Args", 11, {Size=UDim2.new(0,70,0,28),
+        Position=UDim2.new(0,212,0,0), BackgroundColor3=C.Panel,
+        Parent=ActBar}, {Rnd(5)})
+    local RunBtn = Btn("▶ Executar", 11, {Size=UDim2.new(0,100,0,28),
+        Position=UDim2.new(1,-102,0,0), BackgroundColor3=Color3.fromRGB(25,70,35),
+        TextColor3=C.Success, Parent=ActBar}, {Rnd(5)})
+
+    -- LINHA 2: bloqueios (4 tipos)
+    local BlockExactBtn = Btn("🚫 Path", 10, {Size=UDim2.new(0,70,0,28),
+        Position=UDim2.new(0,0,0,34),
         BackgroundColor3=Color3.fromRGB(50,18,18), TextColor3=C.Error,
+        Parent=ActBar}, {Rnd(5)})
+    local BlockSigBtn = Btn("🚫 Args iguais", 10, {Size=UDim2.new(0,110,0,28),
+        Position=UDim2.new(0,76,0,34),
+        BackgroundColor3=Color3.fromRGB(60,18,45), TextColor3=Color3.fromRGB(255,130,220),
+        Parent=ActBar}, {Rnd(5)})
+    local BlockGroupBtn = Btn("🚫 Grupo", 10, {Size=UDim2.new(0,80,0,28),
+        Position=UDim2.new(0,192,0,34),
+        BackgroundColor3=Color3.fromRGB(60,30,18), TextColor3=Color3.fromRGB(255,180,120),
+        Parent=ActBar}, {Rnd(5)})
+    local BlockWildBtn = Btn("🚫 Pasta", 10, {Size=UDim2.new(0,80,0,28),
+        Position=UDim2.new(0,278,0,34),
+        BackgroundColor3=Color3.fromRGB(55,30,55), TextColor3=Color3.fromRGB(230,150,230),
         Parent=ActBar}, {Rnd(5)})
     local RunBtn = Btn("▶ Executar", 11, {Size=UDim2.new(0,94,1,0),
         Position=UDim2.new(1,-96,0,0), BackgroundColor3=Color3.fromRGB(25,70,35),
@@ -397,7 +451,14 @@ function M.build(state)
             srcTxt = srcTxt.."(script não disponível)"
         end
         DScriptLbl.Text = srcTxt
-        DTimeLbl.Text = "⏰ "..(log.timestamp or "?").."  |  args: "..(log.argCount or 0)
+        local timeTxt = "⏰ "..(log.timestamp or "?").."  |  args: "..(log.argCount or 0)
+        if log.remoteNameHidden then
+            timeTxt = timeTxt.."  |  ⚠ nome hex: "..(log.remoteNameHex or "")
+            DTimeLbl.TextColor3 = C.Warning
+        else
+            DTimeLbl.TextColor3 = C.TextM
+        end
+        DTimeLbl.Text = timeTxt
 
         -- gerar script
         CodeBox.Text = "-- gerando..."
@@ -438,15 +499,10 @@ function M.build(state)
             CodeScroll.CanvasPosition = Vector2.new(0,0)
         end)
 
-        -- atualizar Block button
-        if state.blocked[log.remotePath] then
-            BlockBtn.Text = "✅ Desbloquear"
-            BlockBtn.BackgroundColor3 = Color3.fromRGB(25,70,35)
-            BlockBtn.TextColor3 = C.Success
-        else
-            BlockBtn.Text = "🚫 Bloquear"
-            BlockBtn.BackgroundColor3 = Color3.fromRGB(50,18,18)
-            BlockBtn.TextColor3 = C.Error
+        -- atualizar estado dos botões de bloqueio
+        if logMatchesBlockRule(log) then
+            DTypeLbl.Text = (log.type or "?").." [BLOCKED]"
+            DTypeLbl.TextColor3 = C.Error
         end
     end
 
@@ -454,29 +510,95 @@ function M.build(state)
         if not currentLog or currentScript == "" then return end
         if state.env.setclipboard then
             state.env.setclipboard(currentScript)
-            CopyScriptBtn.Text = "✅ Copiado!"
-            task.delay(1.2, function() CopyScriptBtn.Text = "📋 Copiar Script" end)
+            CopyScriptBtn.Text = "✅!"
+            task.delay(1.2, function() CopyScriptBtn.Text = "📋 Copiar" end)
         end
     end)
 
     CopyPathBtn.MouseButton1Click:Connect(function()
         if not currentLog then return end
         if state.env.setclipboard then
-            state.env.setclipboard(currentLog.remotePath or "")
-            CopyPathBtn.Text = "✅ Copiado!"
-            task.delay(1.2, function() CopyPathBtn.Text = "📝 Copiar Path" end)
+            local p = currentLog.remotePath or ""
+            if currentLog.remoteNameHidden then
+                p = p.."\n-- nome hex: "..(currentLog.remoteNameHex or "")
+            end
+            state.env.setclipboard(p)
+            CopyPathBtn.Text = "✅!"
+            task.delay(1.2, function() CopyPathBtn.Text = "📝 Path" end)
         end
     end)
 
-    BlockBtn.MouseButton1Click:Connect(function()
-        if not currentLog then return end
-        local p = currentLog.remotePath
-        if state.blocked[p] then
-            state.blocked[p] = nil
-        else
-            state.blocked[p] = true
+    -- copiar só os args serializados
+    CopyArgsBtn.MouseButton1Click:Connect(function()
+        if not currentLog or not state.env.setclipboard then return end
+        local ok, code = pcall(state.serializer.encode, currentLog.args or {})
+        if ok then
+            state.env.setclipboard(code)
+            CopyArgsBtn.Text = "✅!"
+            task.delay(1.2, function() CopyArgsBtn.Text = "📦 Args" end)
         end
-        showDetail(currentLog)
+    end)
+
+    -- Bloqueio exato (path literal)
+    BlockExactBtn.MouseButton1Click:Connect(function()
+        if not currentLog then return end
+        local path = currentLog.remotePath
+        local removed = state.blockerLib.removeRule(state.blocker, "exact", path)
+        if not removed then
+            state.blockerLib.addRule(state.blocker, "exact", path, {silent = state.config.hideBlocked})
+            BlockExactBtn.Text = "✅ Path"
+        else
+            BlockExactBtn.Text = "🚫 Path"
+        end
+        if uiApi then pcall(uiApi.rebuild) end
+        task.delay(1.5, function() BlockExactBtn.Text = "🚫 Path" end)
+    end)
+
+    -- Bloqueio por SIGNATURE (mesmos args primitivos) — o mais poderoso
+    -- Exemplo: bloqueia todos os FireServer(970, {"Items","InUse"}, ...) de uma vez
+    BlockSigBtn.MouseButton1Click:Connect(function()
+        if not currentLog then return end
+        local sk = state.blockerLib.signatureKey(currentLog)
+        local removed = state.blockerLib.removeRule(state.blocker, "signature", sk)
+        if not removed then
+            state.blockerLib.addRule(state.blocker, "signature", sk, {silent = state.config.hideBlocked})
+            BlockSigBtn.Text = "✅ Args bloq."
+        else
+            BlockSigBtn.Text = "🚫 Args iguais"
+        end
+        if uiApi then pcall(uiApi.rebuild) end
+        task.delay(1.5, function() BlockSigBtn.Text = "🚫 Args iguais" end)
+    end)
+
+    -- Bloqueio por grupo (mesmo parent + shape do nome — pega mutações de nome)
+    BlockGroupBtn.MouseButton1Click:Connect(function()
+        if not currentLog then return end
+        local gk = state.blockerLib.groupKey(currentLog)
+        local removed = state.blockerLib.removeRule(state.blocker, "group", gk)
+        if not removed then
+            state.blockerLib.addRule(state.blocker, "group", gk, {silent = state.config.hideBlocked})
+            BlockGroupBtn.Text = "✅ Grupo"
+        else
+            BlockGroupBtn.Text = "🚫 Grupo"
+        end
+        if uiApi then pcall(uiApi.rebuild) end
+        task.delay(1.5, function() BlockGroupBtn.Text = "🚫 Grupo" end)
+    end)
+
+    -- Bloqueio por pasta (wildcard pai.*)
+    BlockWildBtn.MouseButton1Click:Connect(function()
+        if not currentLog then return end
+        local parent = state.blockerLib.parentPath(currentLog.remotePath)
+        local wild = parent..".*"
+        local removed = state.blockerLib.removeRule(state.blocker, "wildcard", wild)
+        if not removed then
+            state.blockerLib.addRule(state.blocker, "wildcard", wild, {silent = state.config.hideBlocked})
+            BlockWildBtn.Text = "✅ Pasta"
+        else
+            BlockWildBtn.Text = "🚫 Pasta"
+        end
+        if uiApi then pcall(uiApi.rebuild) end
+        task.delay(1.5, function() BlockWildBtn.Text = "🚫 Pasta" end)
     end)
 
     RunBtn.MouseButton1Click:Connect(function()
@@ -510,6 +632,66 @@ function M.build(state)
         CodeBox.Text = "-- logs limpos"
     end)
 
+    -- Export: gera script Lua completo com TODOS os logs visíveis
+    -- (respeita filtro atual, mas inclui bloqueados se hideBlocked=false)
+    ExportBtn.MouseButton1Click:Connect(function()
+        if not state.env.setclipboard then
+            ExportBtn.Text = "❌ sem clipboard"
+            task.delay(2, function() ExportBtn.Text = "📤 Exportar" end)
+            return
+        end
+        ExportBtn.Text = "⏳ gerando..."
+        task.spawn(function()
+            local parts = {}
+            parts[#parts+1] = "-- Remote Spy Pro - Export"
+            parts[#parts+1] = "-- Total: "..#filtered.." logs"
+            parts[#parts+1] = "-- Gerado em: "..os.date("%Y-%m-%d %H:%M:%S")
+            parts[#parts+1] = ""
+            local needGetNilGlobal = false
+            local chunks = {}
+            for _, log in ipairs(filtered) do
+                local okGen, code, needNil = pcall(state.serializer.encode, log.args or {})
+                if okGen then
+                    if needNil then needGetNilGlobal = true end
+                    local header = string.format(
+                        "\n-- [%d] %s  %s  [%s]\n-- path: %s",
+                        #chunks+1, log.timestamp or "?", log.type or "?",
+                        log.metamethod or "?", log.remotePath or "?")
+                    if log.remoteNameHidden then
+                        header = header.."\n-- ⚠ nome hex: "..(log.remoteNameHex or "")
+                    end
+                    chunks[#chunks+1] = header.."\n"..code
+                end
+            end
+            if needGetNilGlobal then
+                parts[#parts+1] = "local function getNil(name, class)"
+                parts[#parts+1] = "    for _, v in next, getnilinstances() do"
+                parts[#parts+1] = "        if v.ClassName == class and v.Name == name then return v end"
+                parts[#parts+1] = "    end"
+                parts[#parts+1] = "end"
+                parts[#parts+1] = ""
+            end
+            for _, c in ipairs(chunks) do parts[#parts+1] = c end
+            local out = table.concat(parts, "\n")
+
+            -- tenta salvar em arquivo se executor suporta
+            local savedToFile = false
+            if writefile then
+                local fname = "RemoteSpy_Export_"..os.time()..".lua"
+                local ok = pcall(writefile, fname, out)
+                if ok then savedToFile = fname end
+            end
+
+            state.env.setclipboard(out)
+            if savedToFile then
+                ExportBtn.Text = "✅ "..savedToFile
+            else
+                ExportBtn.Text = "✅ no clipboard"
+            end
+            task.delay(3, function() ExportBtn.Text = "📤 Exportar" end)
+        end)
+    end)
+
     SearchBox:GetPropertyChangedSignal("Text"):Connect(function()
         state.config.filter = SearchBox.Text:lower()
         rebuildFiltered()
@@ -535,36 +717,139 @@ function M.build(state)
         BlkScroll.CanvasSize = UDim2.new(0,0,0,blkLayout.AbsoluteContentSize.Y+16)
     end)
 
-    local function refreshBlocked()
+    local typeColors = {
+        exact     = Color3.fromRGB(255,72,72),
+        signature = Color3.fromRGB(255,130,220),
+        group     = Color3.fromRGB(255,180,80),
+        wildcard  = Color3.fromRGB(220,120,255),
+        pattern   = Color3.fromRGB(120,220,255),
+    }
+
+    local refreshBlocked
+    refreshBlocked = function()
         for _, c in ipairs(BlkList:GetChildren()) do
             if c:IsA("Frame") then c:Destroy() end
         end
-        local any = false
-        for path, _ in pairs(state.blocked) do
-            any = true
-            local row = N("Frame",{Size=UDim2.new(1,-4,0,32),
-                BackgroundColor3=Color3.fromRGB(40,18,18),BorderSizePixel=0,
-                Parent=BlkList},{Rnd(5), Pad(0,10)})
-            Lbl("🚫 "..path, 11, C.Text, Enum.Font.Gotham,{
-                Size=UDim2.new(1,-90,1,0),
+
+        -- ── REGRAS ATIVAS ──
+        local ord = 0
+        ord = ord + 1
+        Lbl("── REGRAS ATIVAS ("..#state.blocker.rules..") ──",
+            10, C.TextD, Enum.Font.GothamBold,{
+            Size=UDim2.new(1,0,0,18), LayoutOrder=ord, Parent=BlkList})
+
+        if #state.blocker.rules == 0 then
+            ord = ord + 1
+            Lbl("Nenhuma regra ativa. Use os botões 🚫 no painel de logs.",
+                10, C.TextM, Enum.Font.Gotham,{
+                Size=UDim2.new(1,0,0,30),
+                TextXAlignment=Enum.TextXAlignment.Center,
+                LayoutOrder=ord, Parent=BlkList})
+        end
+
+        for i, rule in ipairs(state.blocker.rules) do
+            ord = ord + 1
+            local clr = typeColors[rule.type] or C.Error
+            local row = N("Frame",{Size=UDim2.new(1,-4,0,38),
+                BackgroundColor3=Color3.fromRGB(30,20,20),BorderSizePixel=0,
+                LayoutOrder=ord, Parent=BlkList},{Rnd(5),
+                N("UIStroke",{Color=clr, Transparency=0.5, Thickness=1})})
+            Lbl(rule.type:upper(),10,clr,Enum.Font.GothamBold,{
+                Size=UDim2.new(0,60,0,18), Position=UDim2.new(0,10,0,4),Parent=row})
+            Lbl("hits: "..rule.hits,9,C.TextD,Enum.Font.Code,{
+                Size=UDim2.new(0,80,0,14),Position=UDim2.new(0,72,0,6),Parent=row})
+            Lbl(rule.value, 10, C.Text, Enum.Font.Code,{
+                Size=UDim2.new(1,-180,0,16),Position=UDim2.new(0,10,0,20),
                 TextTruncate=Enum.TextTruncate.AtEnd, Parent=row})
-            local unb = Btn("Permitir", 10, {Size=UDim2.new(0,78,0,22),
-                Position=UDim2.new(1,-82,0.5,-11),
+            local unb = Btn("Remover", 10, {Size=UDim2.new(0,78,0,22),
+                Position=UDim2.new(1,-84,0.5,-11),
                 BackgroundColor3=Color3.fromRGB(25,60,30),TextColor3=C.Success,
                 Parent=row},{Rnd(4)})
             unb.MouseButton1Click:Connect(function()
-                state.blocked[path] = nil
-                row:Destroy()
+                state.blockerLib.removeRule(state.blocker, rule.type, rule.value)
+                refreshBlocked()
+                if uiApi then pcall(uiApi.rebuild) end
             end)
         end
-        if not any then
-            Lbl("Nenhum remote bloqueado", 11, C.TextM, Enum.Font.Gotham,{
-                Size=UDim2.new(1,0,0,40), TextXAlignment=Enum.TextXAlignment.Center,
-                Parent=BlkList})
+
+        -- ── SUGESTÕES DE SPAM (auto-detectadas) ──
+        local suggestions = state.blockerLib.getSuggestions(state.blocker)
+        ord = ord + 1
+        Lbl("── SUGESTÕES DE SPAM ("..#suggestions..") ──",
+            10, C.TextD, Enum.Font.GothamBold,{
+            Size=UDim2.new(1,0,0,18), LayoutOrder=ord, Parent=BlkList})
+
+        if #suggestions == 0 then
+            ord = ord + 1
+            Lbl("Nenhum remote com spam detectado ainda.",
+                10, C.TextM, Enum.Font.Gotham,{
+                Size=UDim2.new(1,0,0,24),
+                TextXAlignment=Enum.TextXAlignment.Center,
+                LayoutOrder=ord, Parent=BlkList})
         end
+
+        for _, sug in ipairs(suggestions) do
+            ord = ord + 1
+            local row = N("Frame",{Size=UDim2.new(1,-4,0,52),
+                BackgroundColor3=Color3.fromRGB(40,30,15),BorderSizePixel=0,
+                LayoutOrder=ord, Parent=BlkList},{Rnd(5),
+                N("UIStroke",{Color=C.Warning, Transparency=0.4, Thickness=1})})
+            Lbl("⚠ SPAM", 10, C.Warning, Enum.Font.GothamBold,{
+                Size=UDim2.new(0,54,0,16), Position=UDim2.new(0,10,0,4), Parent=row})
+            Lbl(string.format("%.1f msg/s", sug.rate), 9, C.Warning, Enum.Font.Code,{
+                Size=UDim2.new(0,80,0,14), Position=UDim2.new(0,66,0,6), Parent=row})
+            Lbl("assinatura: "..sug.signatureKey, 9, C.TextD, Enum.Font.Code,{
+                Size=UDim2.new(1,-20,0,14), Position=UDim2.new(0,10,0,20),
+                TextTruncate=Enum.TextTruncate.AtEnd, Parent=row})
+            Lbl("exemplo: "..sug.sample, 9, C.TextM, Enum.Font.Code,{
+                Size=UDim2.new(1,-190,0,14), Position=UDim2.new(0,10,0,34),
+                TextTruncate=Enum.TextTruncate.AtEnd, Parent=row})
+            local accept = Btn("🚫 Bloquear", 10, {Size=UDim2.new(0,80,0,22),
+                Position=UDim2.new(1,-168,0.5,-11),
+                BackgroundColor3=Color3.fromRGB(60,25,25), TextColor3=C.Error,
+                Parent=row},{Rnd(4)})
+            local dismiss = Btn("Ignorar", 10, {Size=UDim2.new(0,68,0,22),
+                Position=UDim2.new(1,-84,0.5,-11),
+                BackgroundColor3=C.Panel, Parent=row},{Rnd(4)})
+            accept.MouseButton1Click:Connect(function()
+                state.blockerLib.acceptSuggestion(state.blocker, sug.signatureKey, state.config.hideBlocked)
+                refreshBlocked()
+                if uiApi then pcall(uiApi.rebuild) end
+            end)
+            dismiss.MouseButton1Click:Connect(function()
+                state.blockerLib.dismissSuggestion(state.blocker, sug.signatureKey)
+                refreshBlocked()
+            end)
+        end
+
+        -- ── BOTÕES GLOBAIS ──
+        ord = ord + 1
+        local controls = N("Frame",{Size=UDim2.new(1,-4,0,32),
+            BackgroundTransparency=1, LayoutOrder=ord, Parent=BlkList})
+        Btn("🗑 Limpar regras",10,{Size=UDim2.new(0,130,1,0),
+            Position=UDim2.new(0,0,0,0),BackgroundColor3=Color3.fromRGB(50,18,18),
+            TextColor3=C.Error, Parent=controls},{Rnd(4)})
+            .MouseButton1Click:Connect(function()
+                state.blockerLib.clearRules(state.blocker)
+                refreshBlocked()
+                if uiApi then pcall(uiApi.rebuild) end
+            end)
+        Btn("🔄 Atualizar",10,{Size=UDim2.new(0,100,1,0),
+            Position=UDim2.new(0,138,0,0),BackgroundColor3=C.Panel,
+            Parent=controls},{Rnd(4)})
+            .MouseButton1Click:Connect(refreshBlocked)
     end
 
     tabs["Blocked"].MouseButton1Click:Connect(refreshBlocked)
+    -- auto-refresh suggestions em background
+    task.spawn(function()
+        while Gui.Parent do
+            task.wait(2)
+            if currentTab == "Blocked" then
+                pcall(refreshBlocked)
+            end
+        end
+    end)
 
     -- ╔══════════════════════════════════════╗
     -- ║           ABA CONFIG                 ║
@@ -617,6 +902,43 @@ function M.build(state)
     cfgTog("Habilitar captura", "enabled")
     cfgTog("Logar chamadas do próprio executor (checkcaller)", "logCheckCaller")
     cfgTog("Logar OnClientEvent (Server → Client)", "logClientEvents")
+
+    cfgSec("── BLOQUEIO ──")
+    cfgTog("Esconder bloqueados da lista", "hideBlocked")
+    -- listener: quando toggle hideBlocked muda, rebuild da lista
+    task.spawn(function()
+        local last = state.config.hideBlocked
+        while Gui.Parent do
+            task.wait(0.3)
+            if state.config.hideBlocked ~= last then
+                last = state.config.hideBlocked
+                rebuildFiltered()
+                CountLbl.Text = #filtered.." logs"
+                renderList()
+            end
+        end
+    end)
+
+    -- slider de threshold de spam
+    ord = ord + 1
+    local spamRow = N("Frame",{Size=UDim2.new(1,-4,0,32),BackgroundColor3=C.Panel,
+        BorderSizePixel=0,LayoutOrder=ord,Parent=CfgList},{Rnd(5), Pad(0,10)})
+    local spamLbl = Lbl("Threshold spam: "..state.blocker.config.autoBlockThreshold.." msg/s",
+        11, C.Text, Enum.Font.Gotham,{Size=UDim2.new(0.7,0,1,0),Parent=spamRow})
+    Btn("−",13,{Size=UDim2.new(0,24,0,18),Position=UDim2.new(1,-56,0.5,-9),
+        BackgroundColor3=C.BG, Parent=spamRow},{Rnd(4)})
+        .MouseButton1Click:Connect(function()
+            state.blocker.config.autoBlockThreshold = math.max(2,
+                state.blocker.config.autoBlockThreshold - 1)
+            spamLbl.Text = "Threshold spam: "..state.blocker.config.autoBlockThreshold.." msg/s"
+        end)
+    Btn("+",13,{Size=UDim2.new(0,24,0,18),Position=UDim2.new(1,-28,0.5,-9),
+        BackgroundColor3=C.AccentD, Parent=spamRow},{Rnd(4)})
+        .MouseButton1Click:Connect(function()
+            state.blocker.config.autoBlockThreshold = math.min(100,
+                state.blocker.config.autoBlockThreshold + 1)
+            spamLbl.Text = "Threshold spam: "..state.blocker.config.autoBlockThreshold.." msg/s"
+        end)
 
     cfgSec("── INTERFACE ──")
     cfgTog("Auto-scroll", "autoScroll")
