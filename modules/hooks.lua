@@ -79,8 +79,9 @@ function M.init(env, callback)
 
     -- wrapper comum de log
     local function emit(method, self, args, metamethod)
-        if not env.config.enabled then return end
-        if not env.config.logCheckCaller and checkcaller() then return end
+        local cfg = env.config
+        if not cfg or not cfg.enabled then return end
+        if not cfg.logCheckCaller and checkcaller() then return end
 
         if isCyclic(args) then return end
         args = deepclone(args)
@@ -129,9 +130,10 @@ function M.init(env, callback)
     end
 
     -- ── MÉTODO 1: __namecall via hookmetamethod ──
+    local namecallOk = false
     if hookmetamethod and getnamecallmethod then
         local oldNC
-        local ok = pcall(function()
+        local ok, err = pcall(function()
             oldNC = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
                 local method = getnamecallmethod()
                 if method == "FireServer" or method == "InvokeServer" then
@@ -158,6 +160,9 @@ function M.init(env, callback)
         end)
         if ok then
             M._originals.__namecall = oldNC
+            namecallOk = true
+        else
+            warn("[RSP] __namecall hook falhou: "..tostring(err))
         end
     end
 
@@ -165,10 +170,11 @@ function M.init(env, callback)
     -- (captura remote.FireServer(remote, ...) cached-call)
     if hookfunction then
         local function hookProto(className, methodName, key)
-            local temp = Instance.new(className)
+            local okCreate, temp = pcall(Instance.new, className)
+            if not okCreate then return false end
             local orig = temp[methodName]
             temp:Destroy()
-            local ok = pcall(function()
+            local ok, err = pcall(function()
                 M._originals[key] = hookfunction(orig, newcclosure(function(self, ...)
                     if typeof(self) == "Instance" then
                         local args = {...}
@@ -182,11 +188,15 @@ function M.init(env, callback)
                     return M._originals[key](self, ...)
                 end))
             end)
+            if not ok then
+                warn("[RSP] hookProto("..className..","..methodName..") falhou: "..tostring(err))
+            end
             return ok
         end
 
         hookProto("RemoteEvent", "FireServer", "FireServer")
         hookProto("RemoteFunction", "InvokeServer", "InvokeServer")
+        -- UnreliableRemoteEvent só existe em versões recentes, falha silenciosa ok
         pcall(function()
             hookProto("UnreliableRemoteEvent", "FireServer", "UnreliableFireServer")
         end)
@@ -202,8 +212,9 @@ function M.init(env, callback)
         patched[obj] = true
         pcall(function()
             obj.OnClientEvent:Connect(function(...)
-                if not env.config.enabled then return end
-                if not env.config.logClientEvents then return end
+                local cfg = env.config
+                if not cfg or not cfg.enabled then return end
+                if not cfg.logClientEvents then return end
                 M.stats.ce = M.stats.ce + 1
                 local args = {...}
                 if isCyclic(args) then return end

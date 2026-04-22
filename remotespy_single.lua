@@ -408,8 +408,9 @@ function M.init(env, callback)
 
     -- wrapper comum de log
     local function emit(method, self, args, metamethod)
-        if not env.config.enabled then return end
-        if not env.config.logCheckCaller and checkcaller() then return end
+        local cfg = env.config
+        if not cfg or not cfg.enabled then return end
+        if not cfg.logCheckCaller and checkcaller() then return end
 
         if isCyclic(args) then return end
         args = deepclone(args)
@@ -458,9 +459,10 @@ function M.init(env, callback)
     end
 
     -- ── MÉTODO 1: __namecall via hookmetamethod ──
+    local namecallOk = false
     if hookmetamethod and getnamecallmethod then
         local oldNC
-        local ok = pcall(function()
+        local ok, err = pcall(function()
             oldNC = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
                 local method = getnamecallmethod()
                 if method == "FireServer" or method == "InvokeServer" then
@@ -487,6 +489,9 @@ function M.init(env, callback)
         end)
         if ok then
             M._originals.__namecall = oldNC
+            namecallOk = true
+        else
+            warn("[RSP] __namecall hook falhou: "..tostring(err))
         end
     end
 
@@ -494,10 +499,11 @@ function M.init(env, callback)
     -- (captura remote.FireServer(remote, ...) cached-call)
     if hookfunction then
         local function hookProto(className, methodName, key)
-            local temp = Instance.new(className)
+            local okCreate, temp = pcall(Instance.new, className)
+            if not okCreate then return false end
             local orig = temp[methodName]
             temp:Destroy()
-            local ok = pcall(function()
+            local ok, err = pcall(function()
                 M._originals[key] = hookfunction(orig, newcclosure(function(self, ...)
                     if typeof(self) == "Instance" then
                         local args = {...}
@@ -511,11 +517,15 @@ function M.init(env, callback)
                     return M._originals[key](self, ...)
                 end))
             end)
+            if not ok then
+                warn("[RSP] hookProto("..className..","..methodName..") falhou: "..tostring(err))
+            end
             return ok
         end
 
         hookProto("RemoteEvent", "FireServer", "FireServer")
         hookProto("RemoteFunction", "InvokeServer", "InvokeServer")
+        -- UnreliableRemoteEvent só existe em versões recentes, falha silenciosa ok
         pcall(function()
             hookProto("UnreliableRemoteEvent", "FireServer", "UnreliableFireServer")
         end)
@@ -531,8 +541,9 @@ function M.init(env, callback)
         patched[obj] = true
         pcall(function()
             obj.OnClientEvent:Connect(function(...)
-                if not env.config.enabled then return end
-                if not env.config.logClientEvents then return end
+                local cfg = env.config
+                if not cfg or not cfg.enabled then return end
+                if not cfg.logClientEvents then return end
                 M.stats.ce = M.stats.ce + 1
                 local args = {...}
                 if isCyclic(args) then return end
@@ -1214,13 +1225,9 @@ function M.build(state)
 
     CloseBtn.MouseButton1Click:Connect(function() Gui:Destroy() end)
 
-    -- abrir aba inicial
-    tabs["Logs"].MouseButton1Click:Fire()
-    for _, b in pairs(tabs) do
-        if b == tabs["Logs"] then
-            b.BackgroundColor3 = C.Accent; b.TextColor3 = C.BG
-        end
-    end
+    -- abrir aba inicial (não usar :Fire() - RBXScriptSignal não tem esse método)
+    tabs["Logs"].BackgroundColor3 = C.Accent
+    tabs["Logs"].TextColor3 = C.BG
     tabContents["Logs"].Visible = true
     currentTab = "Logs"
 
@@ -1290,7 +1297,7 @@ end)()
 --═══════════════════════════════════════════════════════
 -- CONFIGURE AQUI: URL base do seu repositório (sem barra final)
 --═══════════════════════════════════════════════════════
-local BASE_URL = "https://raw.githubusercontent.com/SEU_USUARIO/SEU_REPO/main"
+local BASE_URL = "https://raw.githubusercontent.com/TsXK-shift/test-rspy/refs/heads/main"
 --═══════════════════════════════════════════════════════
 
 -- Detectar se rodando do arquivo único (build_single.lua coloca os módulos em getgenv())
@@ -1352,9 +1359,18 @@ print("[RSP] Executor:", env.Name)
 print("[RSP] hookfunction:", tostring(env.CanHookFunction),
       "| hookmetamethod:", tostring(env.CanHookMeta))
 
-local serializer = loadModule("serializer")
-local hooks      = loadModule("hooks")
-local ui         = loadModule("ui")
+local okS, serializer = pcall(loadModule, "serializer")
+if not okS then
+    warn("[RSP] FALHA serializer:", serializer); return
+end
+local okH, hooks = pcall(loadModule, "hooks")
+if not okH then
+    warn("[RSP] FALHA hooks:", hooks); return
+end
+local okU, ui = pcall(loadModule, "ui")
+if not okU then
+    warn("[RSP] FALHA ui:", ui); return
+end
 
 state.serializer = serializer
 state.hookStats = hooks.stats
@@ -1373,62 +1389,65 @@ state.isBlocked = function(remote)
     return state.blocked[path] == true
 end
 
--- expor config pros hooks lerem
+-- CRÍTICO: setar env.config ANTES de hooks.init,
+-- porque o hook começa a interceptar imediatamente e acessa env.config
 env.config = state.config
 env.isBlocked = state.isBlocked
 
 -- ╔══════════════════════════════════════╗
--- ║ CRÍTICO: hooks ANTES da UI           ║
+-- ║ hooks ANTES da UI                    ║
 -- ╚══════════════════════════════════════╝
--- Isso garante que o primeiro FireServer do jogo seja capturado.
--- Se esperar a UI (tween de 0.3s + task.wait), perde tudo o que
--- dispara na inicialização.
 
-local uiApi  -- declarada antes pra closure do callback
-local addLogQueue = {}  -- fila: logs que chegam antes da UI montar
+local uiApi
+local addLogQueue = {}
 
 local function logCallback(data)
-    -- metadata comum
     data.id = #state.logs + 1
     data.timestamp = os.date("%H:%M:%S")
-    data.argsPreview = serializer.previewArgs(data.args or {}, 6)
+    local okP, preview = pcall(serializer.previewArgs, data.args or {}, 6)
+    data.argsPreview = okP and preview or "(?)"
 
     table.insert(state.logs, data)
     if #state.logs > 500 then table.remove(state.logs, 1) end
 
-    -- stats por path
     local p = data.remotePath or "?"
     state.stats[p] = state.stats[p] or {calls=0, blocked=0}
     state.stats[p].calls = state.stats[p].calls + 1
     if data.blocked then state.stats[p].blocked = state.stats[p].blocked + 1 end
 
     if uiApi then
-        uiApi.onNewLog(data)
+        pcall(uiApi.onNewLog, data)
     else
         table.insert(addLogQueue, data)
     end
 end
 
--- escolher hook mode display
+-- determinar hookMode
 local hookMode = "fallback"
 if env.CanHookMeta then hookMode = "namecall+hookfunction"
 elseif env.CanHookFunction then hookMode = "hookfunction" end
 env.hookMode = hookMode
 
--- INICIALIZAR HOOKS IMEDIATAMENTE
-local okInit, errInit = hooks.init(env, logCallback)
+-- INICIALIZAR HOOKS
+local okInit, errInit = pcall(hooks.init, env, logCallback)
 if not okInit then
-    warn("[RSP] Erro ao inicializar hooks: "..tostring(errInit))
+    warn("[RSP] ❌ Erro ao inicializar hooks: "..tostring(errInit))
+else
+    print("[RSP] ✓ Hooks ativos em modo:", hookMode)
 end
-print("[RSP] ✓ Hooks ativos em modo:", hookMode)
 
 -- ── UI ──
-uiApi = ui.build(state)
+local okUi, uiResult = pcall(ui.build, state)
+if not okUi then
+    warn("[RSP] ❌ Erro ao montar UI: "..tostring(uiResult))
+    return
+end
+uiApi = uiResult
 
 -- drenar fila acumulada
 if #addLogQueue > 0 then
     print("[RSP] drenando", #addLogQueue, "logs pré-UI")
-    uiApi.rebuild()
+    pcall(uiApi.rebuild)
 end
 
 -- Exportar pro escopo global pra poder inspecionar

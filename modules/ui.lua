@@ -638,13 +638,9 @@ function M.build(state)
 
     CloseBtn.MouseButton1Click:Connect(function() Gui:Destroy() end)
 
-    -- abrir aba inicial
-    tabs["Logs"].MouseButton1Click:Fire()
-    for _, b in pairs(tabs) do
-        if b == tabs["Logs"] then
-            b.BackgroundColor3 = C.Accent; b.TextColor3 = C.BG
-        end
-    end
+    -- abrir aba inicial (não usar :Fire() - RBXScriptSignal não tem esse método)
+    tabs["Logs"].BackgroundColor3 = C.Accent
+    tabs["Logs"].TextColor3 = C.BG
     tabContents["Logs"].Visible = true
     currentTab = "Logs"
 

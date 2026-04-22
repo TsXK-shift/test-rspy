@@ -77,9 +77,18 @@ print("[RSP] Executor:", env.Name)
 print("[RSP] hookfunction:", tostring(env.CanHookFunction),
       "| hookmetamethod:", tostring(env.CanHookMeta))
 
-local serializer = loadModule("serializer")
-local hooks      = loadModule("hooks")
-local ui         = loadModule("ui")
+local okS, serializer = pcall(loadModule, "serializer")
+if not okS then
+    warn("[RSP] FALHA serializer:", serializer); return
+end
+local okH, hooks = pcall(loadModule, "hooks")
+if not okH then
+    warn("[RSP] FALHA hooks:", hooks); return
+end
+local okU, ui = pcall(loadModule, "ui")
+if not okU then
+    warn("[RSP] FALHA ui:", ui); return
+end
 
 state.serializer = serializer
 state.hookStats = hooks.stats
@@ -98,62 +107,65 @@ state.isBlocked = function(remote)
     return state.blocked[path] == true
 end
 
--- expor config pros hooks lerem
+-- CRÍTICO: setar env.config ANTES de hooks.init,
+-- porque o hook começa a interceptar imediatamente e acessa env.config
 env.config = state.config
 env.isBlocked = state.isBlocked
 
 -- ╔══════════════════════════════════════╗
--- ║ CRÍTICO: hooks ANTES da UI           ║
+-- ║ hooks ANTES da UI                    ║
 -- ╚══════════════════════════════════════╝
--- Isso garante que o primeiro FireServer do jogo seja capturado.
--- Se esperar a UI (tween de 0.3s + task.wait), perde tudo o que
--- dispara na inicialização.
 
-local uiApi  -- declarada antes pra closure do callback
-local addLogQueue = {}  -- fila: logs que chegam antes da UI montar
+local uiApi
+local addLogQueue = {}
 
 local function logCallback(data)
-    -- metadata comum
     data.id = #state.logs + 1
     data.timestamp = os.date("%H:%M:%S")
-    data.argsPreview = serializer.previewArgs(data.args or {}, 6)
+    local okP, preview = pcall(serializer.previewArgs, data.args or {}, 6)
+    data.argsPreview = okP and preview or "(?)"
 
     table.insert(state.logs, data)
     if #state.logs > 500 then table.remove(state.logs, 1) end
 
-    -- stats por path
     local p = data.remotePath or "?"
     state.stats[p] = state.stats[p] or {calls=0, blocked=0}
     state.stats[p].calls = state.stats[p].calls + 1
     if data.blocked then state.stats[p].blocked = state.stats[p].blocked + 1 end
 
     if uiApi then
-        uiApi.onNewLog(data)
+        pcall(uiApi.onNewLog, data)
     else
         table.insert(addLogQueue, data)
     end
 end
 
--- escolher hook mode display
+-- determinar hookMode
 local hookMode = "fallback"
 if env.CanHookMeta then hookMode = "namecall+hookfunction"
 elseif env.CanHookFunction then hookMode = "hookfunction" end
 env.hookMode = hookMode
 
--- INICIALIZAR HOOKS IMEDIATAMENTE
-local okInit, errInit = hooks.init(env, logCallback)
+-- INICIALIZAR HOOKS
+local okInit, errInit = pcall(hooks.init, env, logCallback)
 if not okInit then
-    warn("[RSP] Erro ao inicializar hooks: "..tostring(errInit))
+    warn("[RSP] ❌ Erro ao inicializar hooks: "..tostring(errInit))
+else
+    print("[RSP] ✓ Hooks ativos em modo:", hookMode)
 end
-print("[RSP] ✓ Hooks ativos em modo:", hookMode)
 
 -- ── UI ──
-uiApi = ui.build(state)
+local okUi, uiResult = pcall(ui.build, state)
+if not okUi then
+    warn("[RSP] ❌ Erro ao montar UI: "..tostring(uiResult))
+    return
+end
+uiApi = uiResult
 
 -- drenar fila acumulada
 if #addLogQueue > 0 then
     print("[RSP] drenando", #addLogQueue, "logs pré-UI")
-    uiApi.rebuild()
+    pcall(uiApi.rebuild)
 end
 
 -- Exportar pro escopo global pra poder inspecionar
