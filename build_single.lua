@@ -8,7 +8,7 @@
     O arquivo de saída NÃO depende de HttpGet, pode rodar offline.
 ]]
 
-local modules = {"serializer", "blocker", "hooks", "ui"}
+local modules = {"serializer", "blocker", "scanner", "hooks", "ui"}
 
 local function readFile(path)
     local f = io.open(path, "r")

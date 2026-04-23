@@ -635,6 +635,179 @@ return M
 end)()
 
 -- ═══════════════════════════════════════
+-- módulo: scanner
+-- ═══════════════════════════════════════
+getgenv().__RSP_MODULES.scanner = (function()
+--[[
+    RSP Scanner - descobre TUDO que existe, mesmo sem ser disparado
+
+    Diferente dos hooks (que só pegam o que é ativo), o scanner:
+      - lista todos RemoteEvent/RemoteFunction/BindableEvent/BindableFunction no game
+      - enumera globals (_G, getgenv())
+      - inspeciona connections ativas via getconnections (se disponível)
+      - lista scripts (LocalScript) ativos
+
+    Isso é descoberta passiva - não intercepta, só lê o que está lá.
+]]
+
+local M = {}
+
+local function safePath(inst)
+    local ok, r = pcall(function()
+        local parts, cur, d = {}, inst, 0
+        while cur and cur ~= game and d < 30 do
+            table.insert(parts, 1, cur.Name)
+            cur = cur.Parent
+            d = d + 1
+        end
+        return table.concat(parts, ".")
+    end)
+    return ok and r or tostring(inst)
+end
+
+-- 1. Scanner de Remotes/Bindables
+-- retorna lista completa classificada
+function M.scanInstances()
+    local result = {
+        RemoteEvent = {},
+        RemoteFunction = {},
+        UnreliableRemoteEvent = {},
+        BindableEvent = {},
+        BindableFunction = {},
+    }
+    pcall(function()
+        for _, obj in ipairs(game:GetDescendants()) do
+            local ok, cls = pcall(function() return obj.ClassName end)
+            if ok and result[cls] then
+                table.insert(result[cls], {
+                    name = obj.Name,
+                    path = safePath(obj),
+                    instance = obj,
+                })
+            end
+        end
+    end)
+    -- ordena por path
+    for _, list in pairs(result) do
+        table.sort(list, function(a, b) return a.path < b.path end)
+    end
+    return result
+end
+
+-- 2. Scanner de globals (getgenv + _G)
+-- útil pra ver o que scripts do jogo expõem
+function M.scanGlobals()
+    local result = {}
+    local function add(k, v, source)
+        local t = type(v)
+        local info = {
+            key = tostring(k),
+            type = t,
+            source = source,
+        }
+        if t == "function" then
+            local okDbg, dbg = pcall(debug.info, v, "s")
+            info.location = okDbg and dbg or nil
+        elseif t == "table" then
+            local n = 0
+            for _ in pairs(v) do
+                n = n + 1
+                if n > 50 then break end
+            end
+            info.size = n
+        elseif t == "string" or t == "number" or t == "boolean" then
+            info.value = tostring(v):sub(1, 100)
+        end
+        table.insert(result, info)
+    end
+
+    pcall(function()
+        -- _G (globals legacy)
+        for k, v in pairs(_G or {}) do
+            if k ~= "_G" and k ~= "_ENV" then
+                add(k, v, "_G")
+            end
+        end
+    end)
+    if getgenv then
+        pcall(function()
+            for k, v in pairs(getgenv()) do
+                -- pula builtins comuns pra não poluir
+                if type(k) == "string" and not k:match("^[A-Za-z][A-Za-z0-9_]*$") then
+                    add(k, v, "getgenv")
+                elseif type(k) == "string" and #k > 0
+                    and k ~= "_G" and k ~= "_ENV"
+                    and k ~= "script" and k ~= "game" and k ~= "workspace"
+                    and k ~= "task" and k ~= "Enum" and k ~= "Instance"
+                    and k ~= "shared" and k ~= "getgenv" and k ~= "getrenv"
+                then
+                    add(k, v, "getgenv")
+                end
+            end
+        end)
+    end
+    table.sort(result, function(a, b) return a.key < b.key end)
+    return result
+end
+
+-- 3. Scanner de connections (se getconnections disponível)
+-- mostra quantos listeners cada remote tem + de onde vêm
+function M.scanConnections(remoteEventInstance)
+    if not getconnections then return nil, "getconnections não disponível neste executor" end
+    local ok, conns = pcall(getconnections, remoteEventInstance.OnClientEvent)
+    if not ok then return nil, tostring(conns) end
+    local result = {}
+    for i, c in ipairs(conns) do
+        local info = { index = i }
+        pcall(function() info.state = c.State end)
+        pcall(function() info.func = c.Function end)
+        pcall(function()
+            if info.func then
+                local dbg = debug.info(info.func, "s")
+                info.location = dbg
+            end
+        end)
+        result[i] = info
+    end
+    return result
+end
+
+-- 4. Scanner de LocalScripts ativos
+function M.scanScripts()
+    local result = {}
+    pcall(function()
+        for _, obj in ipairs(game:GetDescendants()) do
+            local ok, isLs = pcall(function() return obj:IsA("LocalScript") or obj:IsA("ModuleScript") end)
+            if ok and isLs then
+                local enabled = true
+                pcall(function() enabled = obj.Enabled ~= false end)
+                table.insert(result, {
+                    name = obj.Name,
+                    path = safePath(obj),
+                    instance = obj,
+                    class = obj.ClassName,
+                    enabled = enabled,
+                })
+            end
+        end
+    end)
+    table.sort(result, function(a, b) return a.path < b.path end)
+    return result
+end
+
+-- tenta descompilar um script (se decompile disponível)
+function M.tryDecompile(scriptInstance)
+    if not decompile then return nil, "decompile não disponível" end
+    local ok, src = pcall(decompile, scriptInstance)
+    if not ok then return nil, tostring(src) end
+    return src
+end
+
+return M
+
+end)()
+
+-- ═══════════════════════════════════════
 -- módulo: hooks
 -- ═══════════════════════════════════════
 getgenv().__RSP_MODULES.hooks = (function()
@@ -659,7 +832,7 @@ getgenv().__RSP_MODULES.hooks = (function()
 ]]
 
 local M = {
-    stats = { ns = 0, fs = 0, is = 0, ufs = 0, ce = 0 },
+    stats = { ns = 0, fs = 0, is = 0, ufs = 0, ce = 0, bind = 0, http = 0 },
     _installed = false,
     _originals = {},
 }
@@ -949,6 +1122,112 @@ function M.init(env, callback)
         game.DescendantAdded:Connect(function(obj) task.defer(watchRE, obj) end)
     end)
 
+    -- ── BINDABLE EVENT/FUNCTION ──
+    -- captura comunicação interna do client (UI, hotkeys, sistemas internos)
+    if hookfunction then
+        local function hookBindable(className, methodName, resultType)
+            local okCreate, temp = pcall(Instance.new, className)
+            if not okCreate then return end
+            local orig = temp[methodName]
+            temp:Destroy()
+            pcall(function()
+                M._originals[className..methodName] = hookfunction(orig, newcclosure(function(self, ...)
+                    local cfg = env.config
+                    if typeof(self) ~= "Instance" or not cfg or not cfg.enabled then
+                        return M._originals[className..methodName](self, ...)
+                    end
+                    if not cfg.logBindables then
+                        return M._originals[className..methodName](self, ...)
+                    end
+                    local args = {...}
+                    if not isCyclic(args) then
+                        local rawName = self.Name
+                        local displayName, hiddenFlag, nameHex = processName(rawName)
+                        local data = {
+                            type       = resultType,
+                            remoteType = className,
+                            remote     = self,
+                            remoteName = displayName,
+                            remoteNameRaw = rawName,
+                            remoteNameHidden = hiddenFlag,
+                            remoteNameHex = nameHex,
+                            remoteKey  = stableKey(self),
+                            remotePath = safePath(self),
+                            args       = deepclone(args),
+                            argCount   = #args,
+                            metamethod = "hookfunction",
+                        }
+                        local blockRes = env.checkBlock and env.checkBlock(data)
+                        if blockRes and blockRes.silent then
+                            if methodName == "Invoke" then return nil end
+                            return
+                        end
+                        data.blocked = blockRes and blockRes.blocked or false
+                        M.stats.bind = (M.stats.bind or 0) + 1
+                        callback(data)
+                        if blockRes and blockRes.blocked then
+                            if methodName == "Invoke" then return nil end
+                            return
+                        end
+                    end
+                    return M._originals[className..methodName](self, ...)
+                end))
+            end)
+        end
+        hookBindable("BindableEvent", "Fire", "BindableFire")
+        hookBindable("BindableFunction", "Invoke", "BindableInvoke")
+    end
+
+    -- ── HTTP SPY ──
+    -- captura requests externos (HttpService:GetAsync/PostAsync/RequestAsync)
+    -- útil pra ver endpoints que o jogo chama (analytics, apis externas, etc)
+    if hookfunction then
+        local HttpService = game:GetService("HttpService")
+        local function hookHttp(methodName)
+            local orig = HttpService[methodName]
+            if type(orig) ~= "function" then return end
+            pcall(function()
+                M._originals["http_"..methodName] = hookfunction(orig, newcclosure(function(self, ...)
+                    local cfg = env.config
+                    if typeof(self) ~= "Instance" or not cfg or not cfg.enabled or not cfg.logHttp then
+                        return M._originals["http_"..methodName](self, ...)
+                    end
+                    local args = {...}
+                    if not isCyclic(args) then
+                        local url = "?"
+                        if methodName == "RequestAsync" and type(args[1]) == "table" then
+                            url = tostring(args[1].Url or "?")
+                        elseif type(args[1]) == "string" then
+                            url = args[1]
+                        end
+                        local data = {
+                            type       = "Http_"..methodName,
+                            remoteType = "HttpService",
+                            remote     = self,
+                            remoteName = methodName,
+                            remoteNameRaw = methodName,
+                            remoteNameHidden = false,
+                            remoteKey  = "http_"..methodName,
+                            remotePath = "HttpService."..methodName.." → "..(#url > 80 and url:sub(1,77).."..." or url),
+                            args       = deepclone(args),
+                            argCount   = #args,
+                            metamethod = "hookfunction",
+                        }
+                        local blockRes = env.checkBlock and env.checkBlock(data)
+                        if blockRes and blockRes.silent then return end
+                        data.blocked = blockRes and blockRes.blocked or false
+                        M.stats.http = (M.stats.http or 0) + 1
+                        callback(data)
+                    end
+                    return M._originals["http_"..methodName](self, ...)
+                end))
+            end)
+        end
+        hookHttp("GetAsync")
+        hookHttp("PostAsync")
+        hookHttp("RequestAsync")
+    end
+
     return true
 end
 
@@ -1105,7 +1384,8 @@ function M.build(state)
     end
     mkTab("Logs", 1)
     mkTab("Blocked", 2)
-    mkTab("Config", 3)
+    mkTab("Scanner", 3)
+    mkTab("Config", 4)
 
     -- ╔══════════════════════════════════════╗
     -- ║           ABA LOGS                   ║
@@ -1452,7 +1732,6 @@ function M.build(state)
                 local pathCode = string.format('game:GetService("%s")',
                     log.remote and log.remote:FindFirstAncestorOfClass("Workspace") and "Workspace"
                     or "ReplicatedStorage")
-                -- usar serializer pra path exato
                 local okP, pathExact = pcall(state.serializer.encodeSingle, log.remote)
                 if okP and pathExact then pathCode = pathExact end
 
@@ -1461,13 +1740,30 @@ function M.build(state)
                     call = pathCode..":FireServer(unpack(args))"
                 elseif log.type == "InvokeServer" then
                     call = "local returned = "..pathCode..":InvokeServer(unpack(args))"
+                elseif log.type == "OnClientEvent" then
+                    -- gera firesignal pra simular recepção no cliente (útil pra testar UI)
+                    call = "-- replay no cliente (requer executor com firesignal):\n"
+                        .."-- firesignal("..pathCode..".OnClientEvent, unpack(args))\n"
+                        .."-- ou conectar listener:\n"
+                        .."-- "..pathCode..".OnClientEvent:Connect(function(...) print(...) end)"
+                elseif log.type == "BindableFire" then
+                    call = "-- simula Fire do BindableEvent (comunicação interna):\n"
+                        ..pathCode..":Fire(unpack(args))"
+                elseif log.type == "BindableInvoke" then
+                    call = "-- simula Invoke do BindableFunction:\n"
+                        .."local returned = "..pathCode..":Invoke(unpack(args))"
+                elseif log.type and log.type:find("^Http_") then
+                    local method = log.type:sub(6)
+                    call = string.format(
+                        "-- chamada HTTP interceptada:\n"..
+                        "local result = game:GetService(\"HttpService\"):%s(unpack(args))",
+                        method)
                 else
-                    call = "-- "..pathCode..":FireServer(unpack(args))  -- (é OnClientEvent, só log)"
+                    call = "-- (tipo desconhecido)"
                 end
                 currentScript = header..code.."\n\n"..call
             end
             CodeBox.Text = currentScript
-            -- ajustar altura da textbox com base em linhas
             local lines = 1
             for _ in currentScript:gmatch("\n") do lines = lines + 1 end
             local h = math.max(400, lines * 14)
@@ -1829,6 +2125,219 @@ function M.build(state)
     end)
 
     -- ╔══════════════════════════════════════╗
+    -- ║          ABA SCANNER                 ║
+    -- ╚══════════════════════════════════════╝
+    local ScTab = tabContents["Scanner"]
+
+    local ScTopBar = N("Frame",{Size=UDim2.new(1,-16,0,32),
+        Position=UDim2.new(0,8,0,8), BackgroundTransparency=1, Parent=ScTab})
+    local scanType = "remotes"
+    local scanTabs = {}
+    local function mkScanTab(name, label, order)
+        local b = Btn(label, 11, {Size=UDim2.new(0,110,1,0),
+            Position=UDim2.new(0,(order-1)*116,0,0),
+            BackgroundColor3=C.Panel, TextColor3=C.TextD,
+            Parent=ScTopBar},{Rnd(5)})
+        scanTabs[name] = b
+        return b
+    end
+    local scB1 = mkScanTab("remotes", "📡 Remotes", 1)
+    local scB2 = mkScanTab("bindables", "🔗 Bindables", 2)
+    local scB3 = mkScanTab("scripts", "📜 Scripts", 3)
+    local scB4 = mkScanTab("globals", "🌐 Globals", 4)
+    local scanBtn = Btn("🔄 Rescan", 11, {Size=UDim2.new(0,86,1,0),
+        Position=UDim2.new(1,-90,0,0),
+        BackgroundColor3=C.AccentD, Parent=ScTopBar},{Rnd(5)})
+
+    local ScCount = Lbl("", 10, C.TextD, Enum.Font.Code,{
+        Size=UDim2.new(1,-16,0,14),Position=UDim2.new(0,8,0,44),Parent=ScTab})
+
+    local ScScroll = N("ScrollingFrame",{Size=UDim2.new(1,-16,1,-72),
+        Position=UDim2.new(0,8,0,62), BackgroundColor3=C.BG,
+        BorderSizePixel=0, ScrollBarThickness=4,
+        ScrollBarImageColor3=C.Border, CanvasSize=UDim2.new(0,0,0,0),
+        Parent=ScTab},{Rnd(5)})
+    local ScList = N("Frame",{Size=UDim2.new(1,0,0,0),
+        BackgroundTransparency=1, Parent=ScScroll},{
+        N("UIListLayout",{Padding=UDim.new(0,2), SortOrder=Enum.SortOrder.LayoutOrder}),
+        Pad(4,6)})
+    local scLayout = ScList:FindFirstChildOfClass("UIListLayout")
+    scLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+        ScScroll.CanvasSize = UDim2.new(0,0,0,scLayout.AbsoluteContentSize.Y+12)
+    end)
+
+    local function clearScanList()
+        for _, c in ipairs(ScList:GetChildren()) do
+            if c:IsA("Frame") or c:IsA("TextLabel") then c:Destroy() end
+        end
+    end
+
+    local function scanRowClass(cls)
+        local colors = {
+            RemoteEvent = Color3.fromRGB(90,170,255),
+            RemoteFunction = Color3.fromRGB(175,115,255),
+            UnreliableRemoteEvent = Color3.fromRGB(130,130,255),
+            BindableEvent = Color3.fromRGB(255,160,55),
+            BindableFunction = Color3.fromRGB(255,115,75),
+            LocalScript = Color3.fromRGB(90,230,130),
+            ModuleScript = Color3.fromRGB(130,210,180),
+        }
+        return colors[cls] or C.Accent
+    end
+
+    local function runScan()
+        clearScanList()
+        ScCount.Text = "escaneando..."
+        task.spawn(function()
+            local ord = 0
+            if scanType == "remotes" then
+                local r = state.scanner.scanInstances()
+                local total = #r.RemoteEvent + #r.RemoteFunction + #r.UnreliableRemoteEvent
+                ScCount.Text = string.format(
+                    "📡 %d Remotes  |  RE:%d  RF:%d  UnRE:%d",
+                    total, #r.RemoteEvent, #r.RemoteFunction, #r.UnreliableRemoteEvent)
+                for _, cls in ipairs({"RemoteEvent","RemoteFunction","UnreliableRemoteEvent"}) do
+                    for _, item in ipairs(r[cls]) do
+                        ord = ord + 1
+                        local row = N("Frame",{Size=UDim2.new(1,-4,0,26),
+                            BackgroundColor3=C.Panel,BorderSizePixel=0,
+                            LayoutOrder=ord, Parent=ScList},{Rnd(4),Pad(0,8)})
+                        local clr = scanRowClass(cls)
+                        N("Frame",{Size=UDim2.new(0,3,1,-6),
+                            Position=UDim2.new(0,-5,0,3),BackgroundColor3=clr,
+                            BorderSizePixel=0,Parent=row},{Rnd(2)})
+                        Lbl(cls,9,clr,Enum.Font.GothamBold,{
+                            Size=UDim2.new(0,120,1,0),Parent=row})
+                        Lbl(item.path,10,C.Text,Enum.Font.Code,{
+                            Size=UDim2.new(1,-196,1,0),Position=UDim2.new(0,126,0,0),
+                            TextTruncate=Enum.TextTruncate.AtEnd,Parent=row})
+                        Btn("Copiar",9,{Size=UDim2.new(0,62,0,18),
+                            Position=UDim2.new(1,-66,0.5,-9),
+                            BackgroundColor3=C.AccentD,Parent=row},{Rnd(3)})
+                            .MouseButton1Click:Connect(function()
+                                if state.env.setclipboard then
+                                    local ok, p = pcall(state.serializer.encodeSingle, item.instance)
+                                    state.env.setclipboard(ok and p or item.path)
+                                end
+                            end)
+                    end
+                end
+            elseif scanType == "bindables" then
+                local r = state.scanner.scanInstances()
+                local total = #r.BindableEvent + #r.BindableFunction
+                ScCount.Text = string.format(
+                    "🔗 %d Bindables  |  BE:%d  BF:%d",
+                    total, #r.BindableEvent, #r.BindableFunction)
+                for _, cls in ipairs({"BindableEvent","BindableFunction"}) do
+                    for _, item in ipairs(r[cls]) do
+                        ord = ord + 1
+                        local row = N("Frame",{Size=UDim2.new(1,-4,0,26),
+                            BackgroundColor3=C.Panel,BorderSizePixel=0,
+                            LayoutOrder=ord, Parent=ScList},{Rnd(4),Pad(0,8)})
+                        local clr = scanRowClass(cls)
+                        Lbl(cls,9,clr,Enum.Font.GothamBold,{
+                            Size=UDim2.new(0,120,1,0),Parent=row})
+                        Lbl(item.path,10,C.Text,Enum.Font.Code,{
+                            Size=UDim2.new(1,-196,1,0),Position=UDim2.new(0,126,0,0),
+                            TextTruncate=Enum.TextTruncate.AtEnd,Parent=row})
+                        Btn("Copiar",9,{Size=UDim2.new(0,62,0,18),
+                            Position=UDim2.new(1,-66,0.5,-9),
+                            BackgroundColor3=C.AccentD,Parent=row},{Rnd(3)})
+                            .MouseButton1Click:Connect(function()
+                                if state.env.setclipboard then
+                                    local ok, p = pcall(state.serializer.encodeSingle, item.instance)
+                                    state.env.setclipboard(ok and p or item.path)
+                                end
+                            end)
+                    end
+                end
+            elseif scanType == "scripts" then
+                local r = state.scanner.scanScripts()
+                ScCount.Text = "📜 "..#r.." Scripts"
+                for _, item in ipairs(r) do
+                    ord = ord + 1
+                    local row = N("Frame",{Size=UDim2.new(1,-4,0,26),
+                        BackgroundColor3=C.Panel,BorderSizePixel=0,
+                        LayoutOrder=ord, Parent=ScList},{Rnd(4),Pad(0,8)})
+                    local clr = scanRowClass(item.class)
+                    Lbl(item.class,9,clr,Enum.Font.GothamBold,{
+                        Size=UDim2.new(0,100,1,0),Parent=row})
+                    Lbl(item.enabled and "✓" or "✗", 11,
+                        item.enabled and C.Success or C.Error,Enum.Font.GothamBold,{
+                        Size=UDim2.new(0,14,1,0),Position=UDim2.new(0,104,0,0),Parent=row})
+                    Lbl(item.path,10,C.Text,Enum.Font.Code,{
+                        Size=UDim2.new(1,-196,1,0),Position=UDim2.new(0,124,0,0),
+                        TextTruncate=Enum.TextTruncate.AtEnd,Parent=row})
+                    if decompile then
+                        Btn("Decompile",9,{Size=UDim2.new(0,72,0,18),
+                            Position=UDim2.new(1,-76,0.5,-9),
+                            BackgroundColor3=C.AccentD,Parent=row},{Rnd(3)})
+                            .MouseButton1Click:Connect(function()
+                                local src, err = state.scanner.tryDecompile(item.instance)
+                                if src and state.env.setclipboard then
+                                    state.env.setclipboard(src)
+                                end
+                            end)
+                    end
+                end
+            elseif scanType == "globals" then
+                local r = state.scanner.scanGlobals()
+                ScCount.Text = "🌐 "..#r.." Globals  (getgenv + _G)"
+                for _, item in ipairs(r) do
+                    ord = ord + 1
+                    local row = N("Frame",{Size=UDim2.new(1,-4,0,26),
+                        BackgroundColor3=C.Panel,BorderSizePixel=0,
+                        LayoutOrder=ord, Parent=ScList},{Rnd(4),Pad(0,8)})
+                    local typeClr = item.type == "function" and C.Accent
+                        or item.type == "table" and C.Warning
+                        or C.Text
+                    Lbl("["..item.source.."]",9,C.TextD,Enum.Font.Code,{
+                        Size=UDim2.new(0,60,1,0),Parent=row})
+                    Lbl(item.type,9,typeClr,Enum.Font.GothamBold,{
+                        Size=UDim2.new(0,68,1,0),Position=UDim2.new(0,64,0,0),Parent=row})
+                    local suffix = ""
+                    if item.size then suffix = "  ("..item.size.." items)"
+                    elseif item.value then suffix = "  = "..item.value
+                    elseif item.location then suffix = "  @ "..item.location end
+                    Lbl(item.key..suffix,10,C.Text,Enum.Font.Code,{
+                        Size=UDim2.new(1,-140,1,0),Position=UDim2.new(0,136,0,0),
+                        TextTruncate=Enum.TextTruncate.AtEnd,Parent=row})
+                end
+            end
+            if ord == 0 then
+                Lbl("Nada encontrado", 11, C.TextM, Enum.Font.Gotham,{
+                    Size=UDim2.new(1,0,0,30),
+                    TextXAlignment=Enum.TextXAlignment.Center,
+                    LayoutOrder=1, Parent=ScList})
+            end
+        end)
+    end
+
+    local function setScanType(t)
+        scanType = t
+        for name, b in pairs(scanTabs) do
+            if name == t then
+                b.BackgroundColor3 = C.Accent
+                b.TextColor3 = C.BG
+            else
+                b.BackgroundColor3 = C.Panel
+                b.TextColor3 = C.TextD
+            end
+        end
+        runScan()
+    end
+    scB1.MouseButton1Click:Connect(function() setScanType("remotes") end)
+    scB2.MouseButton1Click:Connect(function() setScanType("bindables") end)
+    scB3.MouseButton1Click:Connect(function() setScanType("scripts") end)
+    scB4.MouseButton1Click:Connect(function() setScanType("globals") end)
+    scanBtn.MouseButton1Click:Connect(runScan)
+    -- auto-scan quando aba é aberta
+    tabs["Scanner"].MouseButton1Click:Connect(function()
+        if scanType == "remotes" then setScanType("remotes") end
+    end)
+    setScanType("remotes")  -- estado inicial
+
+    -- ╔══════════════════════════════════════╗
     -- ║           ABA CONFIG                 ║
     -- ╚══════════════════════════════════════╝
     local CfgTab = tabContents["Config"]
@@ -1879,6 +2388,8 @@ function M.build(state)
     cfgTog("Habilitar captura", "enabled")
     cfgTog("Logar chamadas do próprio executor (checkcaller)", "logCheckCaller")
     cfgTog("Logar OnClientEvent (Server → Client)", "logClientEvents")
+    cfgTog("Logar BindableEvent/BindableFunction (interno do client)", "logBindables")
+    cfgTog("Logar HttpService (GetAsync/PostAsync/RequestAsync)", "logHttp")
 
     cfgSec("── BLOQUEIO ──")
     cfgTog("Esconder bloqueados da lista", "hideBlocked")
@@ -2115,9 +2626,11 @@ local state = {
         enabled = true,
         logCheckCaller = false,
         logClientEvents = true,
+        logBindables = false,  -- BindableEvent/BindableFunction (opt-in, pode gerar spam)
+        logHttp = true,        -- HttpService calls
         autoScroll = true,
         filter = "",
-        hideBlocked = true,     -- filtra bloqueados da view (silenciados já nem chegam)
+        hideBlocked = true,
     },
     env = env,
 }
@@ -2143,11 +2656,16 @@ local okU, ui = pcall(loadModule, "ui")
 if not okU then
     warn("[RSP] FALHA ui:", ui); return
 end
+local okSc, scanner = pcall(loadModule, "scanner")
+if not okSc then
+    warn("[RSP] FALHA scanner:", scanner); return
+end
 
 -- instância do blocker com estado
 state.blocker = blocker.new()
 state.blockerLib = blocker
 state.serializer = serializer
+state.scanner = scanner
 state.hookStats = hooks.stats
 
 -- CRÍTICO: setar env ANTES de hooks.init

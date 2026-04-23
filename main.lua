@@ -65,9 +65,11 @@ local state = {
         enabled = true,
         logCheckCaller = false,
         logClientEvents = true,
+        logBindables = false,  -- BindableEvent/BindableFunction (opt-in, pode gerar spam)
+        logHttp = true,        -- HttpService calls
         autoScroll = true,
         filter = "",
-        hideBlocked = true,     -- filtra bloqueados da view (silenciados já nem chegam)
+        hideBlocked = true,
     },
     env = env,
 }
@@ -93,11 +95,16 @@ local okU, ui = pcall(loadModule, "ui")
 if not okU then
     warn("[RSP] FALHA ui:", ui); return
 end
+local okSc, scanner = pcall(loadModule, "scanner")
+if not okSc then
+    warn("[RSP] FALHA scanner:", scanner); return
+end
 
 -- instância do blocker com estado
 state.blocker = blocker.new()
 state.blockerLib = blocker
 state.serializer = serializer
+state.scanner = scanner
 state.hookStats = hooks.stats
 
 -- CRÍTICO: setar env ANTES de hooks.init

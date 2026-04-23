@@ -19,7 +19,7 @@
 ]]
 
 local M = {
-    stats = { ns = 0, fs = 0, is = 0, ufs = 0, ce = 0 },
+    stats = { ns = 0, fs = 0, is = 0, ufs = 0, ce = 0, bind = 0, http = 0 },
     _installed = false,
     _originals = {},
 }
@@ -308,6 +308,112 @@ function M.init(env, callback)
         end)
         game.DescendantAdded:Connect(function(obj) task.defer(watchRE, obj) end)
     end)
+
+    -- ── BINDABLE EVENT/FUNCTION ──
+    -- captura comunicação interna do client (UI, hotkeys, sistemas internos)
+    if hookfunction then
+        local function hookBindable(className, methodName, resultType)
+            local okCreate, temp = pcall(Instance.new, className)
+            if not okCreate then return end
+            local orig = temp[methodName]
+            temp:Destroy()
+            pcall(function()
+                M._originals[className..methodName] = hookfunction(orig, newcclosure(function(self, ...)
+                    local cfg = env.config
+                    if typeof(self) ~= "Instance" or not cfg or not cfg.enabled then
+                        return M._originals[className..methodName](self, ...)
+                    end
+                    if not cfg.logBindables then
+                        return M._originals[className..methodName](self, ...)
+                    end
+                    local args = {...}
+                    if not isCyclic(args) then
+                        local rawName = self.Name
+                        local displayName, hiddenFlag, nameHex = processName(rawName)
+                        local data = {
+                            type       = resultType,
+                            remoteType = className,
+                            remote     = self,
+                            remoteName = displayName,
+                            remoteNameRaw = rawName,
+                            remoteNameHidden = hiddenFlag,
+                            remoteNameHex = nameHex,
+                            remoteKey  = stableKey(self),
+                            remotePath = safePath(self),
+                            args       = deepclone(args),
+                            argCount   = #args,
+                            metamethod = "hookfunction",
+                        }
+                        local blockRes = env.checkBlock and env.checkBlock(data)
+                        if blockRes and blockRes.silent then
+                            if methodName == "Invoke" then return nil end
+                            return
+                        end
+                        data.blocked = blockRes and blockRes.blocked or false
+                        M.stats.bind = (M.stats.bind or 0) + 1
+                        callback(data)
+                        if blockRes and blockRes.blocked then
+                            if methodName == "Invoke" then return nil end
+                            return
+                        end
+                    end
+                    return M._originals[className..methodName](self, ...)
+                end))
+            end)
+        end
+        hookBindable("BindableEvent", "Fire", "BindableFire")
+        hookBindable("BindableFunction", "Invoke", "BindableInvoke")
+    end
+
+    -- ── HTTP SPY ──
+    -- captura requests externos (HttpService:GetAsync/PostAsync/RequestAsync)
+    -- útil pra ver endpoints que o jogo chama (analytics, apis externas, etc)
+    if hookfunction then
+        local HttpService = game:GetService("HttpService")
+        local function hookHttp(methodName)
+            local orig = HttpService[methodName]
+            if type(orig) ~= "function" then return end
+            pcall(function()
+                M._originals["http_"..methodName] = hookfunction(orig, newcclosure(function(self, ...)
+                    local cfg = env.config
+                    if typeof(self) ~= "Instance" or not cfg or not cfg.enabled or not cfg.logHttp then
+                        return M._originals["http_"..methodName](self, ...)
+                    end
+                    local args = {...}
+                    if not isCyclic(args) then
+                        local url = "?"
+                        if methodName == "RequestAsync" and type(args[1]) == "table" then
+                            url = tostring(args[1].Url or "?")
+                        elseif type(args[1]) == "string" then
+                            url = args[1]
+                        end
+                        local data = {
+                            type       = "Http_"..methodName,
+                            remoteType = "HttpService",
+                            remote     = self,
+                            remoteName = methodName,
+                            remoteNameRaw = methodName,
+                            remoteNameHidden = false,
+                            remoteKey  = "http_"..methodName,
+                            remotePath = "HttpService."..methodName.." → "..(#url > 80 and url:sub(1,77).."..." or url),
+                            args       = deepclone(args),
+                            argCount   = #args,
+                            metamethod = "hookfunction",
+                        }
+                        local blockRes = env.checkBlock and env.checkBlock(data)
+                        if blockRes and blockRes.silent then return end
+                        data.blocked = blockRes and blockRes.blocked or false
+                        M.stats.http = (M.stats.http or 0) + 1
+                        callback(data)
+                    end
+                    return M._originals["http_"..methodName](self, ...)
+                end))
+            end)
+        end
+        hookHttp("GetAsync")
+        hookHttp("PostAsync")
+        hookHttp("RequestAsync")
+    end
 
     return true
 end
