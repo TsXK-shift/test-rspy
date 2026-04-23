@@ -878,6 +878,290 @@ function M.build(state)
     end)
 
     -- ╔══════════════════════════════════════╗
+    -- ║       EDITOR MODAL (VSCode-like)     ║
+    -- ╚══════════════════════════════════════╝
+    -- showCodeEditor(title, code): abre overlay com editor scrollável,
+    -- numeração de linhas, botões copiar/salvar/fechar
+    local function showCodeEditor(title, code, suggestedFilename)
+        code = code or ""
+        -- conta linhas
+        local lines = {}
+        for ln in (code.."\n"):gmatch("([^\n]*)\n") do
+            lines[#lines+1] = ln
+        end
+        local lineCount = #lines
+
+        -- overlay (escurece o fundo)
+        local Overlay = N("Frame",{
+            Name = "RSP_Editor",
+            Size = UDim2.new(1,0,1,0),
+            BackgroundColor3 = Color3.new(0,0,0),
+            BackgroundTransparency = 0.4,
+            BorderSizePixel = 0,
+            ZIndex = 100,
+            Parent = Gui,
+        })
+
+        -- tamanho do editor: quase tela cheia, mas com margem
+        local EW, EH = math.min(900, Win.AbsoluteSize.X * 1.05),
+                       math.min(600, Win.AbsoluteSize.Y * 1.05)
+        -- usa posição relativa pra ficar centralizado na janela do gui,
+        -- mas se o editor for maior que a janela, usa tela inteira
+        local screenSz = workspace.CurrentCamera.ViewportSize
+        EW = math.min(EW, screenSz.X - 40)
+        EH = math.min(EH, screenSz.Y - 40)
+
+        local EditorWin = N("Frame",{
+            Size = UDim2.new(0, EW, 0, EH),
+            Position = UDim2.new(0.5, -EW/2, 0.5, -EH/2),
+            BackgroundColor3 = C.BG,
+            BorderSizePixel = 0,
+            ZIndex = 101,
+            Parent = Overlay,
+        },{ Rnd(8), N("UIStroke",{Color=C.Border, Thickness=1}) })
+
+        -- header (tipo title bar do VSCode)
+        local EHeader = N("Frame",{
+            Size = UDim2.new(1,0,0,36),
+            BackgroundColor3 = C.Surface,
+            BorderSizePixel = 0, ZIndex = 102,
+            Parent = EditorWin,
+        },{ Rnd(8), Pad(0,12) })
+        N("Frame",{Size=UDim2.new(1,0,0,10),Position=UDim2.new(0,0,1,-10),
+            BackgroundColor3=C.Surface,BorderSizePixel=0,ZIndex=102,Parent=EHeader})
+
+        Lbl("📜 "..(title or "script"), 13, C.Text, Enum.Font.GothamMedium,{
+            Size=UDim2.new(1,-240,1,0), TextTruncate=Enum.TextTruncate.AtEnd,
+            ZIndex=103, Parent=EHeader})
+        Lbl(string.format("%d linhas | %d chars", lineCount, #code),
+            10, C.TextD, Enum.Font.Code,{
+            Size=UDim2.new(0,160,1,0), Position=UDim2.new(1,-200,0,0),
+            TextXAlignment=Enum.TextXAlignment.Right, ZIndex=103, Parent=EHeader})
+
+        local ECloseBtn = Btn("✕", 14, {Size=UDim2.new(0,28,0,28),
+            Position=UDim2.new(1,-34,0.5,-14),
+            BackgroundColor3=C.Panel, TextColor3=C.Error,
+            ZIndex=103, Parent=EHeader}, {Rnd(6)})
+
+        -- área principal: gutter (números) | textbox de código
+        local EBody = N("Frame",{
+            Size = UDim2.new(1,-16,1,-86),
+            Position = UDim2.new(0,8,0,44),
+            BackgroundColor3 = C.BG,
+            BorderSizePixel = 0, ZIndex = 102,
+            Parent = EditorWin,
+        },{Rnd(6)})
+
+        local GUTTER_W = 52
+        local Gutter = N("Frame",{
+            Size = UDim2.new(0,GUTTER_W,1,0),
+            BackgroundColor3 = Color3.fromRGB(16,16,22),
+            BorderSizePixel = 0, ZIndex = 103,
+            Parent = EBody,
+        },{Rnd(6)})
+
+        -- conteúdo scrollável
+        local CodeScr = N("ScrollingFrame",{
+            Size = UDim2.new(1,-GUTTER_W,1,0),
+            Position = UDim2.new(0,GUTTER_W,0,0),
+            BackgroundTransparency = 1,
+            BorderSizePixel = 0,
+            ScrollBarThickness = 6,
+            ScrollBarImageColor3 = C.Border,
+            CanvasSize = UDim2.new(0,0,0,0),
+            ZIndex = 103,
+            Parent = EBody,
+        })
+
+        -- calcula altura baseado no número de linhas (line height ~14px)
+        local LINE_H = 14
+        local contentH = math.max(EBody.AbsoluteSize.Y, lineCount * LINE_H + 20)
+
+        -- TextBox editável em read-only = permite selecionar e copiar
+        local CodeBox = N("TextBox",{
+            Size = UDim2.new(1,-16,0,contentH),
+            Position = UDim2.new(0,8,0,6),
+            BackgroundTransparency = 1,
+            BorderSizePixel = 0,
+            Text = code,
+            TextSize = 12,
+            Font = Enum.Font.Code,
+            TextColor3 = Color3.fromRGB(220,220,235),
+            TextXAlignment = Enum.TextXAlignment.Left,
+            TextYAlignment = Enum.TextYAlignment.Top,
+            TextWrapped = false,
+            MultiLine = true,
+            ClearTextOnFocus = false,
+            TextEditable = false,  -- read-only mas selecionável
+            ZIndex = 104,
+            Parent = CodeScr,
+        })
+
+        -- numeração de linhas (gutter)
+        local GutterText = N("TextLabel",{
+            Size = UDim2.new(1,-4,0,contentH),
+            Position = UDim2.new(0,2,0,6),
+            BackgroundTransparency = 1,
+            TextSize = 12,
+            Font = Enum.Font.Code,
+            TextColor3 = C.TextM,
+            TextXAlignment = Enum.TextXAlignment.Right,
+            TextYAlignment = Enum.TextYAlignment.Top,
+            ZIndex = 104,
+            Parent = Gutter,
+        })
+        do
+            local gutterLines = {}
+            for i = 1, lineCount do gutterLines[i] = tostring(i) end
+            GutterText.Text = table.concat(gutterLines, "\n")
+        end
+
+        CodeScr.CanvasSize = UDim2.new(0,0,0,contentH+12)
+
+        -- sincroniza scroll do gutter com o código (gutter também rola)
+        CodeScr:GetPropertyChangedSignal("CanvasPosition"):Connect(function()
+            -- gutter é outro pai, então movo via Position da GutterText
+            local y = CodeScr.CanvasPosition.Y
+            GutterText.Position = UDim2.new(0,2,0,6-y)
+        end)
+
+        -- footer: botões
+        local EFooter = N("Frame",{
+            Size = UDim2.new(1,-16,0,34),
+            Position = UDim2.new(0,8,1,-42),
+            BackgroundTransparency = 1,
+            ZIndex = 103,
+            Parent = EditorWin,
+        },{
+            N("UIListLayout",{FillDirection=Enum.FillDirection.Horizontal,
+                Padding=UDim.new(0,8), SortOrder=Enum.SortOrder.LayoutOrder,
+                VerticalAlignment=Enum.VerticalAlignment.Center})
+        })
+
+        local CopyAllBtn = Btn("📋 Copiar Tudo", 11, {Size=UDim2.new(0,140,0,28),
+            BackgroundColor3=C.AccentD, LayoutOrder=1,
+            ZIndex=104, Parent=EFooter}, {Rnd(5)})
+        local SaveBtn = Btn("💾 Salvar arquivo", 11, {Size=UDim2.new(0,150,0,28),
+            BackgroundColor3=Color3.fromRGB(30,70,40), TextColor3=C.Success,
+            LayoutOrder=2, ZIndex=104, Parent=EFooter}, {Rnd(5)})
+        local FindBtn = Btn("🔍 Buscar", 11, {Size=UDim2.new(0,90,0,28),
+            BackgroundColor3=C.Panel, LayoutOrder=3,
+            ZIndex=104, Parent=EFooter}, {Rnd(5)})
+
+        -- capacidade do executor
+        local hasWriteFile = type(writefile) == "function"
+        if not hasWriteFile then
+            SaveBtn.Text = "💾 Salvar (⚠ writefile ausente)"
+            SaveBtn.AutoButtonColor = false
+            SaveBtn.TextColor3 = C.TextM
+            SaveBtn.BackgroundColor3 = Color3.fromRGB(30,30,35)
+        end
+
+        -- handlers
+        CopyAllBtn.MouseButton1Click:Connect(function()
+            if state.env.setclipboard then
+                state.env.setclipboard(code)
+                CopyAllBtn.Text = "✅ Copiado!"
+                task.delay(1.4, function() CopyAllBtn.Text = "📋 Copiar Tudo" end)
+            else
+                CopyAllBtn.Text = "❌ sem clipboard"
+                task.delay(1.8, function() CopyAllBtn.Text = "📋 Copiar Tudo" end)
+            end
+        end)
+
+        SaveBtn.MouseButton1Click:Connect(function()
+            if not hasWriteFile then return end
+            local fname = suggestedFilename or ("script_"..os.time()..".lua")
+            -- sanitiza nome
+            fname = fname:gsub("[^%w%._%-]", "_")
+            local ok, err = pcall(writefile, fname, code)
+            if ok then
+                SaveBtn.Text = "✅ "..fname
+                task.delay(2.5, function() SaveBtn.Text = "💾 Salvar arquivo" end)
+            else
+                SaveBtn.Text = "❌ erro"
+                warn("[RSP] writefile falhou: "..tostring(err))
+                task.delay(1.8, function() SaveBtn.Text = "💾 Salvar arquivo" end)
+            end
+        end)
+
+        -- Find: campo simples que destaca via seleção
+        FindBtn.MouseButton1Click:Connect(function()
+            -- mostra prompt simples
+            if FindBtn._activeFindBox and FindBtn._activeFindBox.Parent then
+                FindBtn._activeFindBox:Destroy()
+                FindBtn._activeFindBox = nil
+                return
+            end
+            local fb = N("TextBox",{
+                Size = UDim2.new(0,200,0,26),
+                Position = UDim2.new(0,0,0,-30),
+                BackgroundColor3 = C.Panel,
+                BorderSizePixel = 0,
+                PlaceholderText = "texto pra buscar...",
+                Text = "",
+                TextColor3 = C.Text,
+                PlaceholderColor3 = C.TextD,
+                TextSize = 11,
+                Font = Enum.Font.Code,
+                TextXAlignment = Enum.TextXAlignment.Left,
+                ClearTextOnFocus = false,
+                ZIndex = 105,
+                Parent = FindBtn,
+            },{Rnd(4), Pad(0,8)})
+            FindBtn._activeFindBox = fb
+            fb:CaptureFocus()
+            fb.FocusLost:Connect(function(enter)
+                if enter and fb.Text ~= "" then
+                    -- encontra primeira ocorrência, rola até ela
+                    local query = fb.Text:lower()
+                    local found = 0
+                    for i, line in ipairs(lines) do
+                        if line:lower():find(query, 1, true) then
+                            found = i
+                            break
+                        end
+                    end
+                    if found > 0 then
+                        CodeScr.CanvasPosition = Vector2.new(0,
+                            math.max(0, (found-3) * LINE_H))
+                        fb.Text = string.format("linha %d: '%s'", found, query)
+                        fb.TextColor3 = C.Success
+                    else
+                        fb.Text = "'"..query.."' não encontrado"
+                        fb.TextColor3 = C.Error
+                    end
+                end
+                task.delay(2, function() if fb.Parent then fb:Destroy() end end)
+                FindBtn._activeFindBox = nil
+            end)
+        end)
+
+        ECloseBtn.MouseButton1Click:Connect(function()
+            Overlay:Destroy()
+        end)
+        -- clicar no overlay (fora do editor) também fecha
+        local OverlayBtn = N("TextButton",{
+            Text = "",
+            Size = UDim2.new(1,0,1,0),
+            BackgroundTransparency = 1,
+            ZIndex = 100,
+            Parent = Overlay,
+        })
+        OverlayBtn.MouseButton1Click:Connect(function() Overlay:Destroy() end)
+
+        -- garantir que editor fica em cima do botão de clique do overlay
+        EditorWin.ZIndex = 101
+
+        return Overlay
+    end
+
+    -- expor pra outras partes da UI (ex: log export)
+    local function showLoadingEditor(title)
+        return showCodeEditor(title, "-- ⏳ carregando...\n-- (isso pode levar alguns segundos)", nil)
+    end
+
+    -- ╔══════════════════════════════════════╗
     -- ║          ABA SCANNER                 ║
     -- ╚══════════════════════════════════════╝
     local ScTab = tabContents["Scanner"]
@@ -1092,27 +1376,44 @@ function M.build(state)
                             Size=UDim2.new(1,-196,1,0),Position=UDim2.new(0,124,0,0),
                             TextTruncate=Enum.TextTruncate.AtEnd,Parent=row})
                         if decompile then
-                            local decBtn = Btn("Decompile",9,{Size=UDim2.new(0,72,0,18),
-                                Position=UDim2.new(1,-76,0.5,-9),
+                            local decBtn = Btn("Ver código",9,{Size=UDim2.new(0,78,0,18),
+                                Position=UDim2.new(1,-82,0.5,-9),
                                 BackgroundColor3=C.AccentD,Parent=row},{Rnd(3)})
                             decBtn.MouseButton1Click:Connect(function()
-                                if decBtn.Text == "⏳ ..." then return end  -- já decompilando
+                                if decBtn.Text == "⏳ ..." then return end
                                 decBtn.Text = "⏳ ..."
                                 decBtn.AutoButtonColor = false
+                                -- abre editor imediatamente com loading, preenche quando chega
+                                local overlay = showLoadingEditor(item.class.." — "..item.name)
+                                -- referência ao código box do editor pra atualizar
+                                local ebox = overlay:FindFirstChildWhichIsA("Frame", true)
                                 state.scanner.tryDecompile(item.instance, function(src, err)
+                                    if not overlay.Parent then
+                                        -- user já fechou editor
+                                        decBtn.Text = "Ver código"
+                                        decBtn.AutoButtonColor = true
+                                        return
+                                    end
+                                    overlay:Destroy()
                                     if src then
-                                        if state.env.setclipboard then
-                                            state.env.setclipboard(src)
-                                            decBtn.Text = "✅ Copiado!"
-                                        else
-                                            decBtn.Text = "✅ OK"
-                                        end
+                                        local fname = item.name:gsub("[^%w%._%-]","_")..".lua"
+                                        showCodeEditor(item.class.." — "..item.path, src, fname)
+                                        decBtn.Text = "✅ OK"
                                     else
+                                        showCodeEditor(
+                                            "❌ erro ao decompilar "..item.name,
+                                            "-- falha ao descompilar:\n-- "..tostring(err)
+                                                .."\n\n-- motivos comuns:\n"
+                                                .."--   * executor sem suporte a decompile\n"
+                                                .."--   * script protegido / obfuscado\n"
+                                                .."--   * CoreScript do Roblox (bloqueado)\n"
+                                                .."--   * script ainda não carregado\n",
+                                            nil)
                                         decBtn.Text = "❌ erro"
                                         warn("[RSP] decompile falhou: "..tostring(err))
                                     end
                                     task.delay(1.8, function()
-                                        decBtn.Text = "Decompile"
+                                        decBtn.Text = "Ver código"
                                         decBtn.AutoButtonColor = true
                                     end)
                                 end)
@@ -1121,7 +1422,7 @@ function M.build(state)
                     end)
                     doneScanning()
                 end,
-                500  -- limit hardcoded
+                500
             )
         elseif scanType == "globals" then
             -- globals é rápido, faz síncrono
