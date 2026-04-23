@@ -26,8 +26,48 @@ local function safePath(inst)
 end
 
 -- 1. Scanner de Remotes/Bindables
--- retorna lista completa classificada
-function M.scanInstances()
+-- ASSÍNCRONO: varre em lotes com yield pra não travar o client
+-- callback(result) é chamado no fim
+function M.scanInstances(onProgress, onDone)
+    local result = {
+        RemoteEvent = {},
+        RemoteFunction = {},
+        UnreliableRemoteEvent = {},
+        BindableEvent = {},
+        BindableFunction = {},
+    }
+    task.spawn(function()
+        local processed = 0
+        local batch = 0
+        local BATCH_SIZE = 500  -- a cada 500, cede controle
+        pcall(function()
+            for _, obj in ipairs(game:GetDescendants()) do
+                local ok, cls = pcall(function() return obj.ClassName end)
+                if ok and result[cls] then
+                    table.insert(result[cls], {
+                        name = obj.Name,
+                        path = safePath(obj),
+                        instance = obj,
+                    })
+                end
+                processed = processed + 1
+                batch = batch + 1
+                if batch >= BATCH_SIZE then
+                    batch = 0
+                    if onProgress then pcall(onProgress, processed) end
+                    task.wait()  -- cede controle pro render
+                end
+            end
+        end)
+        for _, list in pairs(result) do
+            table.sort(list, function(a, b) return a.path < b.path end)
+        end
+        if onDone then pcall(onDone, result, processed) end
+    end)
+end
+
+-- versão síncrona antiga (deprecated mas mantida por compatibilidade)
+function M.scanInstancesSync()
     local result = {
         RemoteEvent = {},
         RemoteFunction = {},
@@ -36,6 +76,7 @@ function M.scanInstances()
         BindableFunction = {},
     }
     pcall(function()
+        local count = 0
         for _, obj in ipairs(game:GetDescendants()) do
             local ok, cls = pcall(function() return obj.ClassName end)
             if ok and result[cls] then
@@ -45,9 +86,10 @@ function M.scanInstances()
                     instance = obj,
                 })
             end
+            count = count + 1
+            if count % 1000 == 0 then task.wait() end
         end
     end)
-    -- ordena por path
     for _, list in pairs(result) do
         table.sort(list, function(a, b) return a.path < b.path end)
     end
@@ -133,34 +175,89 @@ function M.scanConnections(remoteEventInstance)
 end
 
 -- 4. Scanner de LocalScripts ativos
-function M.scanScripts()
+-- ASSÍNCRONO + LIMITADO: varre só containers comuns (evita Workspace inteiro)
+-- limit: máximo de scripts a retornar (default 500)
+function M.scanScripts(onProgress, onDone, limit)
+    limit = limit or 500
     local result = {}
+    -- só varre containers que tipicamente contêm scripts (evita Workspace enorme)
+    local containers = {
+        game:GetService("ReplicatedStorage"),
+        game:GetService("ReplicatedFirst"),
+        game:GetService("StarterGui"),
+        game:GetService("StarterPack"),
+        game:GetService("StarterPlayer"),
+        game:GetService("Players").LocalPlayer,
+    }
+    -- adiciona PlayerScripts se existe
     pcall(function()
-        for _, obj in ipairs(game:GetDescendants()) do
-            local ok, isLs = pcall(function() return obj:IsA("LocalScript") or obj:IsA("ModuleScript") end)
-            if ok and isLs then
-                local enabled = true
-                pcall(function() enabled = obj.Enabled ~= false end)
-                table.insert(result, {
-                    name = obj.Name,
-                    path = safePath(obj),
-                    instance = obj,
-                    class = obj.ClassName,
-                    enabled = enabled,
-                })
-            end
+        local lp = game:GetService("Players").LocalPlayer
+        if lp and lp:FindFirstChild("PlayerScripts") then
+            table.insert(containers, lp.PlayerScripts)
+        end
+        if lp and lp:FindFirstChild("PlayerGui") then
+            table.insert(containers, lp.PlayerGui)
         end
     end)
-    table.sort(result, function(a, b) return a.path < b.path end)
-    return result
+
+    task.spawn(function()
+        local processed = 0
+        local batch = 0
+        local hitLimit = false
+        local BATCH_SIZE = 200
+
+        for _, container in ipairs(containers) do
+            if hitLimit then break end
+            pcall(function()
+                for _, obj in ipairs(container:GetDescendants()) do
+                    local ok, isLs = pcall(function()
+                        return obj:IsA("LocalScript") or obj:IsA("ModuleScript")
+                    end)
+                    if ok and isLs then
+                        local enabled = true
+                        pcall(function() enabled = obj.Enabled ~= false end)
+                        table.insert(result, {
+                            name = obj.Name,
+                            path = safePath(obj),
+                            instance = obj,
+                            class = obj.ClassName,
+                            enabled = enabled,
+                        })
+                        if #result >= limit then
+                            hitLimit = true
+                            break
+                        end
+                    end
+                    processed = processed + 1
+                    batch = batch + 1
+                    if batch >= BATCH_SIZE then
+                        batch = 0
+                        if onProgress then pcall(onProgress, processed, #result) end
+                        task.wait()
+                    end
+                end
+            end)
+        end
+
+        table.sort(result, function(a, b) return a.path < b.path end)
+        if onDone then pcall(onDone, result, hitLimit, processed) end
+    end)
 end
 
--- tenta descompilar um script (se decompile disponível)
-function M.tryDecompile(scriptInstance)
-    if not decompile then return nil, "decompile não disponível" end
-    local ok, src = pcall(decompile, scriptInstance)
-    if not ok then return nil, tostring(src) end
-    return src
+-- tenta descompilar um script ASSINCRONAMENTE (decompile pode demorar segundos)
+-- callback(source, err)
+function M.tryDecompile(scriptInstance, callback)
+    if not decompile then
+        if callback then callback(nil, "decompile não disponível neste executor") end
+        return
+    end
+    task.spawn(function()
+        local ok, src = pcall(decompile, scriptInstance)
+        if callback then
+            if ok then callback(src, nil)
+            else callback(nil, tostring(src)) end
+        end
+    end)
 end
 
 return M

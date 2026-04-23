@@ -666,8 +666,48 @@ local function safePath(inst)
 end
 
 -- 1. Scanner de Remotes/Bindables
--- retorna lista completa classificada
-function M.scanInstances()
+-- ASSÍNCRONO: varre em lotes com yield pra não travar o client
+-- callback(result) é chamado no fim
+function M.scanInstances(onProgress, onDone)
+    local result = {
+        RemoteEvent = {},
+        RemoteFunction = {},
+        UnreliableRemoteEvent = {},
+        BindableEvent = {},
+        BindableFunction = {},
+    }
+    task.spawn(function()
+        local processed = 0
+        local batch = 0
+        local BATCH_SIZE = 500  -- a cada 500, cede controle
+        pcall(function()
+            for _, obj in ipairs(game:GetDescendants()) do
+                local ok, cls = pcall(function() return obj.ClassName end)
+                if ok and result[cls] then
+                    table.insert(result[cls], {
+                        name = obj.Name,
+                        path = safePath(obj),
+                        instance = obj,
+                    })
+                end
+                processed = processed + 1
+                batch = batch + 1
+                if batch >= BATCH_SIZE then
+                    batch = 0
+                    if onProgress then pcall(onProgress, processed) end
+                    task.wait()  -- cede controle pro render
+                end
+            end
+        end)
+        for _, list in pairs(result) do
+            table.sort(list, function(a, b) return a.path < b.path end)
+        end
+        if onDone then pcall(onDone, result, processed) end
+    end)
+end
+
+-- versão síncrona antiga (deprecated mas mantida por compatibilidade)
+function M.scanInstancesSync()
     local result = {
         RemoteEvent = {},
         RemoteFunction = {},
@@ -676,6 +716,7 @@ function M.scanInstances()
         BindableFunction = {},
     }
     pcall(function()
+        local count = 0
         for _, obj in ipairs(game:GetDescendants()) do
             local ok, cls = pcall(function() return obj.ClassName end)
             if ok and result[cls] then
@@ -685,9 +726,10 @@ function M.scanInstances()
                     instance = obj,
                 })
             end
+            count = count + 1
+            if count % 1000 == 0 then task.wait() end
         end
     end)
-    -- ordena por path
     for _, list in pairs(result) do
         table.sort(list, function(a, b) return a.path < b.path end)
     end
@@ -773,34 +815,89 @@ function M.scanConnections(remoteEventInstance)
 end
 
 -- 4. Scanner de LocalScripts ativos
-function M.scanScripts()
+-- ASSÍNCRONO + LIMITADO: varre só containers comuns (evita Workspace inteiro)
+-- limit: máximo de scripts a retornar (default 500)
+function M.scanScripts(onProgress, onDone, limit)
+    limit = limit or 500
     local result = {}
+    -- só varre containers que tipicamente contêm scripts (evita Workspace enorme)
+    local containers = {
+        game:GetService("ReplicatedStorage"),
+        game:GetService("ReplicatedFirst"),
+        game:GetService("StarterGui"),
+        game:GetService("StarterPack"),
+        game:GetService("StarterPlayer"),
+        game:GetService("Players").LocalPlayer,
+    }
+    -- adiciona PlayerScripts se existe
     pcall(function()
-        for _, obj in ipairs(game:GetDescendants()) do
-            local ok, isLs = pcall(function() return obj:IsA("LocalScript") or obj:IsA("ModuleScript") end)
-            if ok and isLs then
-                local enabled = true
-                pcall(function() enabled = obj.Enabled ~= false end)
-                table.insert(result, {
-                    name = obj.Name,
-                    path = safePath(obj),
-                    instance = obj,
-                    class = obj.ClassName,
-                    enabled = enabled,
-                })
-            end
+        local lp = game:GetService("Players").LocalPlayer
+        if lp and lp:FindFirstChild("PlayerScripts") then
+            table.insert(containers, lp.PlayerScripts)
+        end
+        if lp and lp:FindFirstChild("PlayerGui") then
+            table.insert(containers, lp.PlayerGui)
         end
     end)
-    table.sort(result, function(a, b) return a.path < b.path end)
-    return result
+
+    task.spawn(function()
+        local processed = 0
+        local batch = 0
+        local hitLimit = false
+        local BATCH_SIZE = 200
+
+        for _, container in ipairs(containers) do
+            if hitLimit then break end
+            pcall(function()
+                for _, obj in ipairs(container:GetDescendants()) do
+                    local ok, isLs = pcall(function()
+                        return obj:IsA("LocalScript") or obj:IsA("ModuleScript")
+                    end)
+                    if ok and isLs then
+                        local enabled = true
+                        pcall(function() enabled = obj.Enabled ~= false end)
+                        table.insert(result, {
+                            name = obj.Name,
+                            path = safePath(obj),
+                            instance = obj,
+                            class = obj.ClassName,
+                            enabled = enabled,
+                        })
+                        if #result >= limit then
+                            hitLimit = true
+                            break
+                        end
+                    end
+                    processed = processed + 1
+                    batch = batch + 1
+                    if batch >= BATCH_SIZE then
+                        batch = 0
+                        if onProgress then pcall(onProgress, processed, #result) end
+                        task.wait()
+                    end
+                end
+            end)
+        end
+
+        table.sort(result, function(a, b) return a.path < b.path end)
+        if onDone then pcall(onDone, result, hitLimit, processed) end
+    end)
 end
 
--- tenta descompilar um script (se decompile disponível)
-function M.tryDecompile(scriptInstance)
-    if not decompile then return nil, "decompile não disponível" end
-    local ok, src = pcall(decompile, scriptInstance)
-    if not ok then return nil, tostring(src) end
-    return src
+-- tenta descompilar um script ASSINCRONAMENTE (decompile pode demorar segundos)
+-- callback(source, err)
+function M.tryDecompile(scriptInstance, callback)
+    if not decompile then
+        if callback then callback(nil, "decompile não disponível neste executor") end
+        return
+    end
+    task.spawn(function()
+        local ok, src = pcall(decompile, scriptInstance)
+        if callback then
+            if ok then callback(src, nil)
+            else callback(nil, tostring(src)) end
+        end
+    end)
 end
 
 return M
@@ -2185,27 +2282,69 @@ function M.build(state)
         return colors[cls] or C.Accent
     end
 
-    local function runScan()
-        clearScanList()
-        ScCount.Text = "escaneando..."
+    -- controle de cancelamento (se user trocar de aba durante scan)
+    local scanToken = 0
+
+    -- renderiza uma lista em lotes de 30 pra não travar
+    local function renderBatched(items, renderItem)
+        local ord = 0
+        local token = scanToken
         task.spawn(function()
-            local ord = 0
-            if scanType == "remotes" then
-                local r = state.scanner.scanInstances()
-                local total = #r.RemoteEvent + #r.RemoteFunction + #r.UnreliableRemoteEvent
-                ScCount.Text = string.format(
-                    "📡 %d Remotes  |  RE:%d  RF:%d  UnRE:%d",
-                    total, #r.RemoteEvent, #r.RemoteFunction, #r.UnreliableRemoteEvent)
-                for _, cls in ipairs({"RemoteEvent","RemoteFunction","UnreliableRemoteEvent"}) do
-                    for _, item in ipairs(r[cls]) do
-                        ord = ord + 1
+            for _, item in ipairs(items) do
+                if token ~= scanToken then return end  -- cancelado
+                ord = ord + 1
+                renderItem(item, ord)
+                if ord % 30 == 0 then task.wait() end
+            end
+            if ord == 0 and token == scanToken then
+                Lbl("Nada encontrado", 11, C.TextM, Enum.Font.Gotham,{
+                    Size=UDim2.new(1,0,0,30),
+                    TextXAlignment=Enum.TextXAlignment.Center,
+                    LayoutOrder=1, Parent=ScList})
+            end
+        end)
+    end
+
+    local function runScan()
+        scanToken = scanToken + 1
+        local myToken = scanToken
+        clearScanList()
+        ScCount.Text = "⏳ escaneando..."
+        scanBtn.Text = "⏳ ..."
+        scanBtn.AutoButtonColor = false
+
+        local function doneScanning()
+            scanBtn.Text = "🔄 Rescan"
+            scanBtn.AutoButtonColor = true
+        end
+
+        if scanType == "remotes" then
+            state.scanner.scanInstances(
+                function(progress)
+                    if myToken == scanToken then
+                        ScCount.Text = "⏳ escaneando... "..progress.." instâncias"
+                    end
+                end,
+                function(r, total)
+                    if myToken ~= scanToken then return end
+                    local n = #r.RemoteEvent + #r.RemoteFunction + #r.UnreliableRemoteEvent
+                    ScCount.Text = string.format(
+                        "📡 %d Remotes  (escaneadas %d instâncias)  RE:%d  RF:%d  UnRE:%d",
+                        n, total, #r.RemoteEvent, #r.RemoteFunction, #r.UnreliableRemoteEvent)
+                    -- flatten em uma única lista ordenada
+                    local flat = {}
+                    for _, cls in ipairs({"RemoteEvent","RemoteFunction","UnreliableRemoteEvent"}) do
+                        for _, item in ipairs(r[cls]) do
+                            item._cls = cls
+                            table.insert(flat, item)
+                        end
+                    end
+                    renderBatched(flat, function(item, ord)
+                        local cls = item._cls
                         local row = N("Frame",{Size=UDim2.new(1,-4,0,26),
                             BackgroundColor3=C.Panel,BorderSizePixel=0,
                             LayoutOrder=ord, Parent=ScList},{Rnd(4),Pad(0,8)})
                         local clr = scanRowClass(cls)
-                        N("Frame",{Size=UDim2.new(0,3,1,-6),
-                            Position=UDim2.new(0,-5,0,3),BackgroundColor3=clr,
-                            BorderSizePixel=0,Parent=row},{Rnd(2)})
                         Lbl(cls,9,clr,Enum.Font.GothamBold,{
                             Size=UDim2.new(0,120,1,0),Parent=row})
                         Lbl(item.path,10,C.Text,Enum.Font.Code,{
@@ -2220,17 +2359,32 @@ function M.build(state)
                                     state.env.setclipboard(ok and p or item.path)
                                 end
                             end)
-                    end
+                    end)
+                    doneScanning()
                 end
-            elseif scanType == "bindables" then
-                local r = state.scanner.scanInstances()
-                local total = #r.BindableEvent + #r.BindableFunction
-                ScCount.Text = string.format(
-                    "🔗 %d Bindables  |  BE:%d  BF:%d",
-                    total, #r.BindableEvent, #r.BindableFunction)
-                for _, cls in ipairs({"BindableEvent","BindableFunction"}) do
-                    for _, item in ipairs(r[cls]) do
-                        ord = ord + 1
+            )
+        elseif scanType == "bindables" then
+            state.scanner.scanInstances(
+                function(progress)
+                    if myToken == scanToken then
+                        ScCount.Text = "⏳ escaneando... "..progress.." instâncias"
+                    end
+                end,
+                function(r, total)
+                    if myToken ~= scanToken then return end
+                    local n = #r.BindableEvent + #r.BindableFunction
+                    ScCount.Text = string.format(
+                        "🔗 %d Bindables  (escaneadas %d)  BE:%d  BF:%d",
+                        n, total, #r.BindableEvent, #r.BindableFunction)
+                    local flat = {}
+                    for _, cls in ipairs({"BindableEvent","BindableFunction"}) do
+                        for _, item in ipairs(r[cls]) do
+                            item._cls = cls
+                            table.insert(flat, item)
+                        end
+                    end
+                    renderBatched(flat, function(item, ord)
+                        local cls = item._cls
                         local row = N("Frame",{Size=UDim2.new(1,-4,0,26),
                             BackgroundColor3=C.Panel,BorderSizePixel=0,
                             LayoutOrder=ord, Parent=ScList},{Rnd(4),Pad(0,8)})
@@ -2249,42 +2403,77 @@ function M.build(state)
                                     state.env.setclipboard(ok and p or item.path)
                                 end
                             end)
-                    end
+                    end)
+                    doneScanning()
                 end
-            elseif scanType == "scripts" then
-                local r = state.scanner.scanScripts()
-                ScCount.Text = "📜 "..#r.." Scripts"
-                for _, item in ipairs(r) do
-                    ord = ord + 1
-                    local row = N("Frame",{Size=UDim2.new(1,-4,0,26),
-                        BackgroundColor3=C.Panel,BorderSizePixel=0,
-                        LayoutOrder=ord, Parent=ScList},{Rnd(4),Pad(0,8)})
-                    local clr = scanRowClass(item.class)
-                    Lbl(item.class,9,clr,Enum.Font.GothamBold,{
-                        Size=UDim2.new(0,100,1,0),Parent=row})
-                    Lbl(item.enabled and "✓" or "✗", 11,
-                        item.enabled and C.Success or C.Error,Enum.Font.GothamBold,{
-                        Size=UDim2.new(0,14,1,0),Position=UDim2.new(0,104,0,0),Parent=row})
-                    Lbl(item.path,10,C.Text,Enum.Font.Code,{
-                        Size=UDim2.new(1,-196,1,0),Position=UDim2.new(0,124,0,0),
-                        TextTruncate=Enum.TextTruncate.AtEnd,Parent=row})
-                    if decompile then
-                        Btn("Decompile",9,{Size=UDim2.new(0,72,0,18),
-                            Position=UDim2.new(1,-76,0.5,-9),
-                            BackgroundColor3=C.AccentD,Parent=row},{Rnd(3)})
-                            .MouseButton1Click:Connect(function()
-                                local src, err = state.scanner.tryDecompile(item.instance)
-                                if src and state.env.setclipboard then
-                                    state.env.setclipboard(src)
-                                end
+            )
+        elseif scanType == "scripts" then
+            -- ASYNC + LIMITADO: só containers comuns, max 500 scripts
+            state.scanner.scanScripts(
+                function(processed, found)
+                    if myToken == scanToken then
+                        ScCount.Text = string.format(
+                            "⏳ escaneando... %d instâncias, %d scripts", processed, found)
+                    end
+                end,
+                function(r, hitLimit, processed)
+                    if myToken ~= scanToken then return end
+                    local limitMsg = hitLimit and "  ⚠ (LIMITE 500 atingido - mostrando parciais)" or ""
+                    ScCount.Text = string.format(
+                        "📜 %d Scripts  (varridas %d instâncias em ReplicatedStorage/PlayerGui/etc)%s",
+                        #r, processed, limitMsg)
+                    renderBatched(r, function(item, ord)
+                        local row = N("Frame",{Size=UDim2.new(1,-4,0,26),
+                            BackgroundColor3=C.Panel,BorderSizePixel=0,
+                            LayoutOrder=ord, Parent=ScList},{Rnd(4),Pad(0,8)})
+                        local clr = scanRowClass(item.class)
+                        Lbl(item.class,9,clr,Enum.Font.GothamBold,{
+                            Size=UDim2.new(0,100,1,0),Parent=row})
+                        Lbl(item.enabled and "✓" or "✗", 11,
+                            item.enabled and C.Success or C.Error,Enum.Font.GothamBold,{
+                            Size=UDim2.new(0,14,1,0),Position=UDim2.new(0,104,0,0),Parent=row})
+                        Lbl(item.path,10,C.Text,Enum.Font.Code,{
+                            Size=UDim2.new(1,-196,1,0),Position=UDim2.new(0,124,0,0),
+                            TextTruncate=Enum.TextTruncate.AtEnd,Parent=row})
+                        if decompile then
+                            local decBtn = Btn("Decompile",9,{Size=UDim2.new(0,72,0,18),
+                                Position=UDim2.new(1,-76,0.5,-9),
+                                BackgroundColor3=C.AccentD,Parent=row},{Rnd(3)})
+                            decBtn.MouseButton1Click:Connect(function()
+                                if decBtn.Text == "⏳ ..." then return end  -- já decompilando
+                                decBtn.Text = "⏳ ..."
+                                decBtn.AutoButtonColor = false
+                                state.scanner.tryDecompile(item.instance, function(src, err)
+                                    if src then
+                                        if state.env.setclipboard then
+                                            state.env.setclipboard(src)
+                                            decBtn.Text = "✅ Copiado!"
+                                        else
+                                            decBtn.Text = "✅ OK"
+                                        end
+                                    else
+                                        decBtn.Text = "❌ erro"
+                                        warn("[RSP] decompile falhou: "..tostring(err))
+                                    end
+                                    task.delay(1.8, function()
+                                        decBtn.Text = "Decompile"
+                                        decBtn.AutoButtonColor = true
+                                    end)
+                                end)
                             end)
-                    end
-                end
-            elseif scanType == "globals" then
+                        end
+                    end)
+                    doneScanning()
+                end,
+                500  -- limit hardcoded
+            )
+        elseif scanType == "globals" then
+            -- globals é rápido, faz síncrono
+            task.spawn(function()
                 local r = state.scanner.scanGlobals()
+                if myToken ~= scanToken then return end
                 ScCount.Text = "🌐 "..#r.." Globals  (getgenv + _G)"
-                for _, item in ipairs(r) do
-                    ord = ord + 1
+                renderBatched(r, function(item, ord)
                     local row = N("Frame",{Size=UDim2.new(1,-4,0,26),
                         BackgroundColor3=C.Panel,BorderSizePixel=0,
                         LayoutOrder=ord, Parent=ScList},{Rnd(4),Pad(0,8)})
@@ -2302,15 +2491,10 @@ function M.build(state)
                     Lbl(item.key..suffix,10,C.Text,Enum.Font.Code,{
                         Size=UDim2.new(1,-140,1,0),Position=UDim2.new(0,136,0,0),
                         TextTruncate=Enum.TextTruncate.AtEnd,Parent=row})
-                end
-            end
-            if ord == 0 then
-                Lbl("Nada encontrado", 11, C.TextM, Enum.Font.Gotham,{
-                    Size=UDim2.new(1,0,0,30),
-                    TextXAlignment=Enum.TextXAlignment.Center,
-                    LayoutOrder=1, Parent=ScList})
-            end
-        end)
+                end)
+                doneScanning()
+            end)
+        end
     end
 
     local function setScanType(t)
@@ -2331,11 +2515,11 @@ function M.build(state)
     scB3.MouseButton1Click:Connect(function() setScanType("scripts") end)
     scB4.MouseButton1Click:Connect(function() setScanType("globals") end)
     scanBtn.MouseButton1Click:Connect(runScan)
-    -- auto-scan quando aba é aberta
-    tabs["Scanner"].MouseButton1Click:Connect(function()
-        if scanType == "remotes" then setScanType("remotes") end
-    end)
-    setScanType("remotes")  -- estado inicial
+    -- estado inicial: mostra placeholder, não scaneia automaticamente
+    -- (user escolhe qual tipo com a sub-tab)
+    scanTabs["remotes"].BackgroundColor3 = C.Accent
+    scanTabs["remotes"].TextColor3 = C.BG
+    ScCount.Text = "clique em uma aba acima ou 🔄 Rescan pra começar"
 
     -- ╔══════════════════════════════════════╗
     -- ║           ABA CONFIG                 ║
